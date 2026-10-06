@@ -3,7 +3,7 @@ setlocal
 chcp 65001 >nul
 cd /d "%~dp0"
 
-set "APP_NAME=PVT Tools"
+set "APP_NAME=DouyinVideoManager"
 set "ICON=assets\app_icon.ico"
 
 echo ============================================
@@ -78,12 +78,14 @@ echo Luu y 1: tinh nang ghep audio can ffmpeg + ffprobe (cai vao PATH
 echo hoac chon duong dan trong phan Cai dat cua app).
 echo Luu y 2: neu Explorer van hien icon cu, xoa cache icon hoac doi ten
 echo file .exe / khoi dong lai Explorer de cap nhat.
-explorer "%~dp0dist"
-pause
+if not defined CI (
+    explorer "%~dp0dist"
+    pause
+)
 exit /b 0
 
 :fail
 echo.
 echo [LOI] Build that bai. Xem thong bao phia tren.
-pause
+if not defined CI pause
 exit /b 1
