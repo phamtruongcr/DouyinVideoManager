@@ -56,6 +56,7 @@ rem --onefile   : gop tat ca vao 1 file .exe duy nhat
 rem --windowed  : khong hien cua so console den
 rem --icon      : icon cua file .exe (hien trong Explorer / taskbar khi ghim)
 rem --add-data  : dong goi thu muc assets vao exe de cua so app cung dung icon
+rem yt_dlp / curl_cffi: thu vien TikTok (import tre) - PyInstaller tu gom day du extractor
 rem openpyxl / PIL duoc import "luoi" (trong ham) nen can khai bao hidden-import
 echo.
 echo [4/4] Dang build, vui long doi...
@@ -66,6 +67,8 @@ echo [4/4] Dang build, vui long doi...
     --hidden-import openpyxl ^
     --hidden-import PIL ^
     --hidden-import PIL.ImageFont ^
+    --hidden-import yt_dlp ^
+    --hidden-import curl_cffi ^
     main.py
 if errorlevel 1 goto :fail
 

@@ -25,5 +25,6 @@ d.polygon([(ax - 110, 790), (ax + 110, 790), (ax, 890)], fill="#22c55e")
 d.rounded_rectangle((ax - 230, 905, ax + 230, 940), radius=17, fill="#22c55e")
 
 img.resize((256, 256), Image.LANCZOS).save(out / "app_icon.png")
+img.save(out / "app_icon.icns")  # icon cho macOS
 img.save(out / "app_icon.ico", sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (24, 24), (16, 16)])
 print("Da tao", out / "app_icon.ico")

@@ -7,3 +7,8 @@ pyinstaller>=6.16.0
 # Khuyến nghị: giúp tính ngắt dòng chữ chèn lên video chính xác theo đúng
 # font (không có vẫn chạy được, chỉ dùng ước lượng nên có thể lệch nhẹ).
 Pillow>=10.0.0
+
+# TikTok: lấy danh sách video của kênh + tải video (yt-dlp tự xử lý chữ ký/anti-bot
+# của TikTok). Extra curl-cffi giúp vượt cơ chế chặn bot khi lấy trang kênh.
+# Nếu TikTok đổi cách chặn: pip install -U yt-dlp
+yt-dlp[default,curl-cffi]>=2025.1.1

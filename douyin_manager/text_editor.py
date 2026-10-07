@@ -12,6 +12,9 @@ TRÌNH CHỈNH SỬA CHỮ kiểu CapCut cho tính năng "Chèn chữ lên video
   * TIMELINE: mỗi lớp là 1 thanh — kéo thân thanh để dời, kéo mép trái/phải
     để chỉnh lúc bắt đầu / kết thúc; bấm hoặc kéo trên thước để tua.
   * Mẫu kiểu chữ dựng sẵn (bấm 1 cái là đổi cả kiểu).
+  * Lớp BLUR (không chữ): làm mờ 1 vùng hình chữ nhật (che phụ đề/logo cũ…) —
+    kéo để di chuyển, kéo 4 góc để đổi kích thước, chỉnh độ mờ + thời gian.
+    Khi xuất, mọi lớp blur được áp TRƯỚC rồi mới vẽ chữ lên trên.
 
 Các hàm thuần (không đụng Tk) nằm ở đầu file để dễ kiểm thử; class
 `TextEditorWindow` chỉ lo giao diện. Vị trí chữ lưu dưới dạng TỈ LỆ 0..1 của
@@ -32,6 +35,7 @@ from tkinter import font as tkfont
 from typing import Optional
 
 from .audio_merger import (
+    BLUR_SIGMA_PER_STRENGTH,
     MergeError,
     extract_preview_frame,
     find_default_font,
@@ -51,10 +55,17 @@ from .config import (
 )
 from .widgets import ScrollableFrame, WrapFrame
 
+try:  # Pillow chỉ dùng để xem trước hiệu ứng mờ THẬT; không có vẫn chạy được
+    from PIL import Image, ImageFilter, ImageTk
+except Exception:  # noqa: BLE001
+    Image = ImageFilter = ImageTk = None
+
 MIN_LAYER_SECONDS = 0.1
 DEFAULT_BOX_PAD_PCT = 30     # lề nền chữ (ngang / dọc), tính theo % cỡ chữ
 MAX_BOX_PAD_PCT = 150
 DEFAULT_TOTAL_SECONDS = 10.0
+DEFAULT_BLUR_STRENGTH = 60   # độ mờ mặc định của lớp blur (1..100)
+MIN_BLUR_SIZE = 0.03         # cạnh nhỏ nhất của vùng blur (tỉ lệ khung hình)
 
 
 # ============================================================================
@@ -74,6 +85,7 @@ def is_hex_color(value) -> bool:
 def new_layer(**overrides) -> dict:
     """Một lớp chữ mới với giá trị mặc định (đã chuẩn hóa)."""
     base = dict(
+        kind="text",               # "text" = lớp chữ, "blur" = vùng làm mờ không chữ
         text="Nhập chữ ở đây",
         cx=0.5, cy=0.5,
         size_pct=float(DEFAULT_TEXT_SIZE_PERCENT),
@@ -86,9 +98,37 @@ def new_layer(**overrides) -> dict:
         start=0.0, duration=0.0,   # duration 0 = hiện đến hết video
         font="",                   # "" = font tự động; đường dẫn file = đã chọn file cụ thể
         font_family="",            # "" = font tự động; tên họ font = đã chọn từ danh sách font máy
+        bw=0.8, bh=0.12,           # (chỉ lớp blur) rộng/cao vùng mờ, tỉ lệ 0..1 của khung hình
+        blur=DEFAULT_BLUR_STRENGTH,  # (chỉ lớp blur) độ mờ 1..100
     )
     base.update(overrides)
     return normalize_layer(base)
+
+
+def new_blur_layer(**overrides) -> dict:
+    """Một lớp BLUR mới: vùng mờ nằm ở dải dưới khung hình (chỗ hay có phụ đề
+    cũ). Kéo thả trong trình chỉnh sửa để đặt đúng chỗ cần che."""
+    base = dict(kind="blur", text="", cx=0.5, cy=0.85, bw=0.8, bh=0.12)
+    base.update(overrides)
+    return new_layer(**base)
+
+
+def is_blur(layer: dict) -> bool:
+    return layer.get("kind") == "blur"
+
+
+def fit_blur_center(layer: dict) -> None:
+    """Kẹp tâm (cx, cy) của lớp blur để vùng mờ không tràn ra ngoài khung."""
+    layer["cx"] = clamp(layer["cx"], layer["bw"] / 2, 1.0 - layer["bw"] / 2)
+    layer["cy"] = clamp(layer["cy"], layer["bh"] / 2, 1.0 - layer["bh"] / 2)
+
+
+def blur_rect(layer: dict, ox: float, oy: float, dw: float, dh: float) -> tuple[float, float, float, float]:
+    """Hình chữ nhật (x0, y0, x1, y1) của vùng blur trên khung xem trước."""
+    w, h = layer["bw"] * dw, layer["bh"] * dh
+    x0 = ox + clamp(layer["cx"] * dw - w / 2, 0.0, dw - w)
+    y0 = oy + clamp(layer["cy"] * dh - h / 2, 0.0, dh - h)
+    return x0, y0, x0 + w, y0 + h
 
 
 def normalize_layer(data: dict) -> dict:
@@ -106,7 +146,9 @@ def normalize_layer(data: dict) -> dict:
     def color(key, default):
         return d[key].upper() if is_hex_color(d.get(key)) else default
 
-    return dict(
+    kind = "blur" if d.get("kind") == "blur" else "text"
+    out = dict(
+        kind=kind,
         text=str(d.get("text", "")),
         cx=clamp(num("cx", 0.5), 0.0, 1.0),
         cy=clamp(num("cy", 0.5), 0.0, 1.0),
@@ -125,7 +167,14 @@ def normalize_layer(data: dict) -> dict:
         duration=max(0.0, num("duration", 0.0)),
         font=str(d.get("font", "") or ""),
         font_family=str(d.get("font_family", "") or ""),
+        bw=clamp(num("bw", 0.8), MIN_BLUR_SIZE, 1.0),
+        bh=clamp(num("bh", 0.12), MIN_BLUR_SIZE, 1.0),
+        blur=int(clamp(num("blur", DEFAULT_BLUR_STRENGTH), 1, 100)),
     )
+    if kind == "blur":
+        out["text"] = ""
+        fit_blur_center(out)
+    return out
 
 
 def resolve_layer_font(layer: dict) -> Optional[str]:
@@ -303,6 +352,10 @@ def font_family_for(fontfile: str) -> str:
 
 
 def layer_summary(index: int, layer: dict) -> str:
+    if is_blur(layer):
+        end = "hết" if (layer.get("duration") or 0) <= 0 else f"{layer['start'] + layer['duration']:.1f}s"
+        return (f"{index + 1}. Blur {round(layer['bw'] * 100)}%×{round(layer['bh'] * 100)}%"
+                f"   [{layer['start']:.1f}s → {end}]")
     first = (layer.get("text") or "").strip().splitlines()[0] if (layer.get("text") or "").strip() else "(trống)"
     if len(first) > 22:
         first = first[:21] + "…"
@@ -336,7 +389,7 @@ class TextEditorWindow(tk.Toplevel):
         on_apply,
     ):
         super().__init__(master)
-        self.title("Chỉnh sửa chữ — kiểu CapCut")
+        self.title("Chỉnh sửa chữ & blur — kiểu CapCut")
         self.transient(master.winfo_toplevel())
 
         self.layers: list[dict] = [normalize_layer(layer) for layer in layers]
@@ -356,6 +409,9 @@ class TextEditorWindow(tk.Toplevel):
         self._probe_cache: dict[Path, tuple[float, int, int]] = {}
 
         self._frame_photo = None
+        self._frame_pil = None          # bản PIL của khung hình hiện tại (xem trước blur thật)
+        self._blur_cache: dict = {}     # (vùng, sigma) -> PhotoImage đã làm mờ
+        self._panel_kind: str | None = None
         self._frame_msg = "Đang tải khung hình..."
         self._frame_token = 0
         self._frame_after = None
@@ -405,8 +461,8 @@ class TextEditorWindow(tk.Toplevel):
         bottom.grid(row=1, column=0, sticky="ew")
         hint = ttk.Label(
             bottom, foreground="#555", justify="left",
-            text=("Kéo chữ để di chuyển  •  kéo 4 góc để đổi cỡ  •  phím mũi tên để nhích  •  "
-                  "Delete để xóa  •  kéo thanh dưới timeline để chỉnh thời gian hiện chữ"),
+            text=("Kéo chữ/vùng blur để di chuyển  •  kéo 4 góc để đổi cỡ  •  phím mũi tên để nhích  •  "
+                  "Delete để xóa  •  kéo thanh dưới timeline để chỉnh thời gian"),
         )
         hint.pack(side="left", fill="x", expand=True)
         ttk.Button(bottom, text="✔ Xong", command=self._on_ok).pack(side="right")
@@ -479,7 +535,7 @@ class TextEditorWindow(tk.Toplevel):
         panel.columnconfigure(0, weight=1)
 
         # ---- Danh sách lớp ----
-        box = ttk.LabelFrame(panel, text="Lớp chữ", padding=6)
+        box = ttk.LabelFrame(panel, text="Các lớp (chữ / blur)", padding=6)
         box.pack(fill="x", pady=(0, 6))
         self.listbox = tk.Listbox(box, height=5, exportselection=False, activestyle="none")
         self.listbox.pack(fill="x")
@@ -487,20 +543,45 @@ class TextEditorWindow(tk.Toplevel):
         btns = WrapFrame(box, hgap=4, vgap=4)
         btns.pack(fill="x", pady=(6, 0))
         btns.add(ttk.Button(btns, text="➕ Thêm chữ", command=self._add_layer))
+        btns.add(ttk.Button(btns, text="🌫 Thêm blur", command=self._add_blur_layer))
         btns.add(ttk.Button(btns, text="⧉ Nhân đôi", command=self._duplicate_layer))
         btns.add(ttk.Button(btns, text="▲", width=3, command=lambda: self._move_layer(-1)))
         btns.add(ttk.Button(btns, text="▼", width=3, command=lambda: self._move_layer(1)))
         btns.add(ttk.Button(btns, text="🗑 Xóa", command=self._delete_layer))
 
+        # ---- Vùng blur (chỉ hiện khi chọn lớp blur) ----
+        blur_box = self._pnl_blur = ttk.LabelFrame(panel, text="Vùng làm mờ (blur)", padding=6)
+        blur_box.columnconfigure(1, weight=1)
+        ttk.Label(
+            blur_box, foreground="#555", justify="left", wraplength=330,
+            text="Kéo vùng trên video để di chuyển, kéo 4 góc để đổi kích thước. "
+                 "Dùng để che phụ đề / logo cũ — chữ mới đặt lên trên vẫn rõ nét.",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        self.blur_var = tk.DoubleVar(value=float(DEFAULT_BLUR_STRENGTH))
+        self.blur_w_var = tk.DoubleVar(value=80.0)
+        self.blur_h_var = tk.DoubleVar(value=12.0)
+        self._blur_lbls = {}
+        for row, (key, label, var, lo, hi) in enumerate((
+            ("blur", "Độ mờ:", self.blur_var, 1, 100),
+            ("bw", "Rộng:", self.blur_w_var, MIN_BLUR_SIZE * 100, 100),
+            ("bh", "Cao:", self.blur_h_var, MIN_BLUR_SIZE * 100, 100),
+        ), start=1):
+            ttk.Label(blur_box, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Scale(blur_box, from_=lo, to=hi, variable=var,
+                      command=lambda v: self._on_blur_changed()).grid(row=row, column=1, sticky="ew", padx=6)
+            lbl = ttk.Label(blur_box, text="", width=6)
+            lbl.grid(row=row, column=2, sticky="e")
+            self._blur_lbls[key] = lbl
+
         # ---- Nội dung ----
-        content = ttk.LabelFrame(panel, text="Nội dung (Enter để xuống dòng)", padding=6)
+        content = self._pnl_content = ttk.LabelFrame(panel, text="Nội dung (Enter để xuống dòng)", padding=6)
         content.pack(fill="x", pady=(0, 6))
         self.text_box = tk.Text(content, height=3, width=32, wrap="word", undo=True)
         self.text_box.pack(fill="x")
         self.text_box.bind("<KeyRelease>", lambda e: self._on_text_edited())
 
         # ---- Mẫu kiểu chữ ----
-        presets = ttk.LabelFrame(panel, text="Mẫu kiểu chữ (bấm để áp dụng)", padding=6)
+        presets = self._pnl_presets = ttk.LabelFrame(panel, text="Mẫu kiểu chữ (bấm để áp dụng)", padding=6)
         presets.pack(fill="x", pady=(0, 6))
         pw = WrapFrame(presets, hgap=4, vgap=4)
         pw.pack(fill="x")
@@ -508,7 +589,7 @@ class TextEditorWindow(tk.Toplevel):
             pw.add(ttk.Button(pw, text=name, command=lambda s=style: self._apply_preset(s)))
 
         # ---- Kiểu chữ ----
-        style_box = ttk.LabelFrame(panel, text="Kiểu chữ", padding=6)
+        style_box = self._pnl_style = ttk.LabelFrame(panel, text="Kiểu chữ", padding=6)
         style_box.pack(fill="x", pady=(0, 6))
         style_box.columnconfigure(1, weight=1)
 
@@ -566,7 +647,7 @@ class TextEditorWindow(tk.Toplevel):
         self.box_py_lbl.grid(row=6, column=2, sticky="e")
 
         # ---- Thời gian ----
-        time_box = ttk.LabelFrame(panel, text="Thời gian hiện chữ (giây)", padding=6)
+        time_box = self._pnl_time = ttk.LabelFrame(panel, text="Thời gian hiển thị (giây)", padding=6)
         time_box.pack(fill="x", pady=(0, 6))
         ttk.Label(time_box, text="Bắt đầu:").grid(row=0, column=0, sticky="w", pady=2)
         self.start_var = tk.DoubleVar(value=0.0)
@@ -587,7 +668,7 @@ class TextEditorWindow(tk.Toplevel):
                         command=self._on_time_edited).grid(row=2, column=0, columnspan=2, sticky="w")
 
         # ---- Font ----
-        font_box = ttk.LabelFrame(panel, text="Font chữ", padding=6)
+        font_box = self._pnl_font = ttk.LabelFrame(panel, text="Font chữ", padding=6)
         font_box.pack(fill="x", pady=(0, 6))
         self.font_lbl = ttk.Label(font_box, text="", foreground="#555", justify="left", wraplength=330)
         self.font_lbl.pack(anchor="w")
@@ -638,11 +719,19 @@ class TextEditorWindow(tk.Toplevel):
         self.text_box.focus_set()
         self.text_box.tag_add("sel", "1.0", "end-1c")
 
+    def _add_blur_layer(self):
+        layer = new_blur_layer(start=round(self.playhead, 1))
+        self.layers.append(layer)
+        self._select(len(self.layers) - 1, jump=False)
+        self.stage.focus_set()
+
     def _duplicate_layer(self):
         if self.cur is None:
             return
         clone = copy.deepcopy(self.cur)
         clone["cy"] = clamp(clone["cy"] + 0.08, 0.0, 1.0)
+        if is_blur(clone):
+            fit_blur_center(clone)
         self.layers.insert(self.sel + 1, clone)
         self._select(self.sel + 1, jump=False)
 
@@ -672,8 +761,13 @@ class TextEditorWindow(tk.Toplevel):
             state = "normal" if layer else "disabled"
             self.text_box.configure(state=state)
             self.text_box.delete("1.0", "end")
+            self._apply_kind_visibility()
             if layer is None:
-                self.font_lbl.configure(text="Chưa có lớp chữ nào — bấm \"➕ Thêm chữ\".")
+                self.font_lbl.configure(text="Chưa có lớp nào — bấm \"➕ Thêm chữ\" hoặc \"🌫 Thêm blur\".")
+                return
+            if is_blur(layer):
+                self._sync_blur_panel()
+                self._load_time_to_panel()
                 return
             self.text_box.insert("1.0", layer["text"])
             self.size_var.set(layer["size_pct"])
@@ -695,6 +789,52 @@ class TextEditorWindow(tk.Toplevel):
             self._refresh_font_label()
         finally:
             self._updating = False
+
+    def _apply_kind_visibility(self):
+        """Bảng thuộc tính: lớp blur chỉ cần mục blur + thời gian; lớp chữ cần
+        nội dung/kiểu/font. Chỉ sắp xếp lại khi loại lớp đổi (đỡ giật/mất vị trí cuộn)."""
+        kind = "blur" if (self.cur is not None and is_blur(self.cur)) else "text"
+        if kind == self._panel_kind:
+            return
+        self._panel_kind = kind
+        frames = (self._pnl_blur, self._pnl_content, self._pnl_presets, self._pnl_style,
+                  self._pnl_time, self._pnl_font)
+        for f in frames:
+            f.pack_forget()
+        show = ((self._pnl_blur, self._pnl_time) if kind == "blur" else
+                (self._pnl_content, self._pnl_presets, self._pnl_style, self._pnl_time, self._pnl_font))
+        for f in show:
+            f.pack(fill="x", pady=(0, 6))
+
+    def _sync_blur_panel(self):
+        """Đẩy giá trị của lớp blur đang chọn lên các thanh trượt (không kích hoạt sự kiện)."""
+        layer = self.cur
+        if layer is None or not is_blur(layer):
+            return
+        was = self._updating
+        self._updating = True
+        try:
+            self.blur_var.set(layer["blur"])
+            self.blur_w_var.set(round(layer["bw"] * 100, 1))
+            self.blur_h_var.set(round(layer["bh"] * 100, 1))
+            self._blur_lbls["blur"].configure(text=f"{layer['blur']}%")
+            self._blur_lbls["bw"].configure(text=f"{layer['bw'] * 100:.0f}%")
+            self._blur_lbls["bh"].configure(text=f"{layer['bh'] * 100:.0f}%")
+        finally:
+            self._updating = was
+
+    def _on_blur_changed(self):
+        layer = self.cur
+        if self._updating or layer is None or not is_blur(layer):
+            return
+        layer["blur"] = int(clamp(round(float(self.blur_var.get())), 1, 100))
+        layer["bw"] = round(clamp(float(self.blur_w_var.get()) / 100, MIN_BLUR_SIZE, 1.0), 3)
+        layer["bh"] = round(clamp(float(self.blur_h_var.get()) / 100, MIN_BLUR_SIZE, 1.0), 3)
+        fit_blur_center(layer)
+        self._blur_lbls["blur"].configure(text=f"{layer['blur']}%")
+        self._blur_lbls["bw"].configure(text=f"{layer['bw'] * 100:.0f}%")
+        self._blur_lbls["bh"].configure(text=f"{layer['bh'] * 100:.0f}%")
+        self._changed(list_too=True)
 
     def _load_time_to_panel(self):
         layer = self.cur
@@ -1010,6 +1150,14 @@ class TextEditorWindow(tk.Toplevel):
                         self._frame_msg = f"Không hiển thị được khung hình: {exc}"
                     else:
                         self._frame_photo = photo
+                        self._frame_pil = None
+                        self._blur_cache.clear()
+                        if Image is not None:
+                            try:
+                                with Image.open(path) as im:
+                                    self._frame_pil = im.convert("RGB")
+                            except Exception:  # noqa: BLE001
+                                self._frame_pil = None
                         self.frame_msg_var.set("")
                     self._frame_files.append(path)
                     self._cleanup_old_frames(keep=path)
@@ -1071,8 +1219,14 @@ class TextEditorWindow(tk.Toplevel):
         c.create_rectangle(ox, oy, ox + dw, oy + dh, outline="#777777")
 
         self._geom.clear()
-        for i, layer in enumerate(self.layers):
-            if layer_visible(layer, self.playhead, self.total) and layer["text"].strip():
+        shown = [(i, layer) for i, layer in enumerate(self.layers)
+                 if layer_visible(layer, self.playhead, self.total)]
+        # Giống bộ xuất: blur vẽ trước, chữ nằm đè lên trên
+        for i, layer in shown:
+            if is_blur(layer):
+                self._draw_blur(i, layer, ox, oy, dw, dh)
+        for i, layer in shown:
+            if not is_blur(layer) and layer["text"].strip():
                 self._draw_layer(i, layer, ox, oy, dw, dh)
 
         gv, gh = self._guides
@@ -1093,6 +1247,40 @@ class TextEditorWindow(tk.Toplevel):
         elif self.cur is not None and not layer_visible(self.cur, self.playhead, self.total):
             c.create_text(ox + dw / 2, oy + 14, fill="#ffcc66",
                           text="Lớp đang chọn chưa hiện ở thời điểm này — kéo thước thời gian", width=dw - 20)
+
+    def _blur_preview(self, layer: dict, x0: float, y0: float, x1: float, y1: float, dw: int, dh: int):
+        """PhotoImage vùng đã làm mờ THẬT (cần Pillow) — cùng công thức sigma với
+        bộ xuất (theo tỉ lệ chiều cao khung). None nếu chưa có Pillow/khung hình."""
+        pil = self._frame_pil
+        if pil is None or ImageTk is None or pil.size != (dw, dh):
+            return None
+        ix0, iy0 = int(round(x0)), int(round(y0))
+        ix1, iy1 = max(ix0 + 1, int(round(x1))), max(iy0 + 1, int(round(y1)))
+        sigma = max(0.5, dh * layer["blur"] * BLUR_SIGMA_PER_STRENGTH)
+        key = (ix0, iy0, ix1, iy1, round(sigma, 1))
+        photo = self._blur_cache.get(key)
+        if photo is None:
+            try:
+                region = pil.crop((ix0, iy0, ix1, iy1)).filter(ImageFilter.GaussianBlur(sigma))
+                photo = ImageTk.PhotoImage(region)
+            except Exception:  # noqa: BLE001
+                return None
+            if len(self._blur_cache) > 24:
+                self._blur_cache.clear()
+            self._blur_cache[key] = photo
+        return photo
+
+    def _draw_blur(self, i: int, layer: dict, ox: int, oy: int, dw: int, dh: int):
+        c = self.stage
+        x0, y0, x1, y1 = blur_rect(layer, ox, oy, dw, dh)
+        photo = self._blur_preview(layer, x0 - ox, y0 - oy, x1 - ox, y1 - oy, dw, dh)
+        if photo is not None:
+            c.create_image(round(x0), round(y0), image=photo, anchor="nw")
+        else:   # chưa có Pillow / khung hình: tô mờ tạm để vẫn thấy vùng
+            c.create_rectangle(x0, y0, x1, y1, fill="#cfcfcf", outline="", stipple="gray50")
+        c.create_rectangle(x0, y0, x1, y1, outline="#c084fc", dash=(3, 3))
+        c.create_text(x0 + 4, y0 + 3, text="BLUR", anchor="nw", fill="#e9d5ff", font=("", 8, "bold"))
+        self._geom[i] = (x0, y0, x1, y1)
 
     def _draw_layer(self, i: int, layer: dict, ox: int, oy: int, dw: int, dh: int):
         c = self.stage
@@ -1140,7 +1328,8 @@ class TextEditorWindow(tk.Toplevel):
         return None
 
     def _layer_at(self, x: float, y: float) -> int:
-        for i in sorted(self._geom, reverse=True):     # lớp trên cùng (cuối) ưu tiên
+        # Chữ ưu tiên hơn blur (chữ nằm đè trên blur), rồi tới lớp cuối danh sách
+        for i in sorted(self._geom, key=lambda k: (not is_blur(self.layers[k]), k), reverse=True):
             if point_in_rect(x, y, self._geom[i]):
                 return i
         return -1
@@ -1163,6 +1352,11 @@ class TextEditorWindow(tk.Toplevel):
         self.stage.focus_set()
         ox, oy, dw, dh = self._stage_rect()
         handle = self._handle_at(event.x, event.y) if self.cur is not None else None
+        if handle and self.sel in self._geom and is_blur(self.cur):
+            x0, y0, x1, y1 = self._geom[self.sel]
+            fx, fy = {"tl": (x1, y1), "tr": (x0, y1), "bl": (x1, y0), "br": (x0, y0)}[handle]
+            self._drag = dict(mode="blur_resize", fx=fx, fy=fy)
+            return
         if handle and self.sel in self._geom:
             x0, y0, x1, y1 = self._geom[self.sel]
             ccx, ccy = (x0 + x1) / 2, (y0 + y1) / 2
@@ -1189,13 +1383,32 @@ class TextEditorWindow(tk.Toplevel):
             return
         _ox, _oy, dw, dh = self._stage_rect()
         d = self._drag
-        if d["mode"] == "move":
+        if d["mode"] == "blur_resize":
+            ox, oy, _dw, _dh = self._stage_rect()
+            mx, my = clamp(event.x, ox, ox + dw), clamp(event.y, oy, oy + dh)
+            fx, fy = d["fx"], d["fy"]
+            min_w, min_h = MIN_BLUR_SIZE * dw, MIN_BLUR_SIZE * dh
+            if abs(mx - fx) < min_w:       # không cho thu nhỏ hơn cạnh tối thiểu
+                mx = clamp(fx + (min_w if mx >= fx else -min_w), ox, ox + dw)
+            if abs(my - fy) < min_h:
+                my = clamp(fy + (min_h if my >= fy else -min_h), oy, oy + dh)
+            x0, x1 = sorted((fx, mx))
+            y0, y1 = sorted((fy, my))
+            layer["bw"] = round(clamp((x1 - x0) / dw, MIN_BLUR_SIZE, 1.0), 4)
+            layer["bh"] = round(clamp((y1 - y0) / dh, MIN_BLUR_SIZE, 1.0), 4)
+            layer["cx"] = clamp(((x0 + x1) / 2 - ox) / dw, 0.0, 1.0)
+            layer["cy"] = clamp(((y0 + y1) / 2 - oy) / dh, 0.0, 1.0)
+            fit_blur_center(layer)
+            self._sync_blur_panel()
+        elif d["mode"] == "move":
             cx = clamp(d["cx0"] + (event.x - d["x0"]) / dw, 0.0, 1.0)
             cy = clamp(d["cy0"] + (event.y - d["y0"]) / dh, 0.0, 1.0)
             snap_v = abs(cx * dw - dw / 2) < 6
             snap_h = abs(cy * dh - dh / 2) < 6
             layer["cx"] = 0.5 if snap_v else cx
             layer["cy"] = 0.5 if snap_h else cy
+            if is_blur(layer):
+                fit_blur_center(layer)
             self._guides = (snap_v, snap_h)
         else:
             dist = max(4.0, math.hypot(event.x - d["cx"], event.y - d["cy"]))
@@ -1210,7 +1423,10 @@ class TextEditorWindow(tk.Toplevel):
         self._redraw_stage()
 
     def _on_stage_release(self, _event):
+        was_blur_resize = bool(self._drag and self._drag.get("mode") == "blur_resize")
         self._drag = None
+        if was_blur_resize:
+            self._refresh_layer_list()
         self._guides = (False, False)
         self._redraw_stage()
 
@@ -1221,6 +1437,8 @@ class TextEditorWindow(tk.Toplevel):
         step = 0.02 if big else 0.004
         layer["cx"] = clamp(layer["cx"] + dx * step, 0.0, 1.0)
         layer["cy"] = clamp(layer["cy"] + dy * step, 0.0, 1.0)
+        if is_blur(layer):
+            fit_blur_center(layer)
         self._redraw_stage()
         return "break"
 
@@ -1266,11 +1484,16 @@ class TextEditorWindow(tk.Toplevel):
             bx1 = time_to_x(layer_end(layer, self.total), self.total, x0, x1)
             bx1 = max(bx1, bx0 + 6)
             selected = i == self.sel
-            c.create_rectangle(bx0, y0, bx1, y1, fill="#3b82f6" if selected else "#64748b",
+            blur_bar = is_blur(layer)
+            if blur_bar:
+                fill = "#a855f7" if selected else "#6b5b8a"
+            else:
+                fill = "#3b82f6" if selected else "#64748b"
+            c.create_rectangle(bx0, y0, bx1, y1, fill=fill,
                                outline="#ffffff" if selected else "#94a3b8")
             c.create_rectangle(bx0, y0, bx0 + 4, y1, fill="#ffffff", outline="")
             c.create_rectangle(bx1 - 4, y0, bx1, y1, fill="#ffffff", outline="")
-            label = (layer["text"].strip().splitlines() or [""])[0][:28]
+            label = "Blur" if blur_bar else (layer["text"].strip().splitlines() or [""])[0][:28]
             if bx1 - bx0 > 40 and row_h >= 14:
                 c.create_text(bx0 + 8, (y0 + y1) / 2, text=label, fill="#ffffff", anchor="w", font=("", 8))
 

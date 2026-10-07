@@ -3,7 +3,7 @@ audio_merge_gui.py
 ====================
 TAB "Ghép Audio vào Video" (nằm cạnh tab tải video trong cửa sổ chính):
 chọn thư mục, chế độ ghép cặp (khớp tên / trộn ngẫu nhiên), tùy chọn kích
-thước/tỉ lệ khung hình/chất lượng/hiệu ứng âm thanh/watermark/chèn chữ, xem thử
+thước/tỉ lệ khung hình/chất lượng/hiệu ứng âm thanh/chèn chữ & blur, xem thử
 TỪNG dòng (file xem thử chỉ nằm trong thư mục tạm, tự xóa), xóa dòng không
 ưng ý, tick chọn dòng cần ghép, chạy ffmpeg (song song, dừng được giữa
 chừng), xuất log CSV, tự tránh lặp cặp với các lần chạy trước.
@@ -43,6 +43,7 @@ from .audio_merger import (
     ffmpeg_has_filter,
     find_ffmpeg,
     find_ffprobe,
+    is_blur_layer,
     list_media_files,
     load_pair_history,
     match_video_audio_pairs,
@@ -342,8 +343,8 @@ class AudioMergeTab(ttk.Frame):
         self.option_tabs.add(tab_size, "Kích thước & Tỉ lệ")
         self.option_tabs.add(tab_audio, "Âm thanh nâng cao")
         self.option_tabs.add(tab_bg_music, "Nhạc nền")
-        self.option_tabs.add(tab_text, "Chèn chữ")
-        self.option_tabs.add(tab_advanced, "Watermark & Nâng cao")
+        self.option_tabs.add(tab_text, "Chèn chữ & Blur")
+        self.option_tabs.add(tab_advanced, "Nâng cao")
 
         self._build_tab_size(tab_size)
         self._build_tab_audio(tab_audio)
@@ -618,15 +619,15 @@ class AudioMergeTab(ttk.Frame):
     def _build_tab_text(self, parent):
         self.text_enabled_var = tk.BooleanVar(value=bool(self.cfg.get("merge_text_enabled", False)))
         ttk.Checkbutton(
-            parent, text="Chèn chữ lên video (áp dụng cho mọi video được ghép & cả bản xem thử)",
+            parent, text="Chèn chữ / blur lên video (áp dụng cho mọi video được ghép & cả bản xem thử)",
             variable=self.text_enabled_var, command=self._on_text_toggle,
         ).pack(anchor="w")
 
         bar = WrapFrame(parent, hgap=8, vgap=6)
         bar.pack(fill="x", pady=(8, 4))
-        bar.add(ttk.Button(bar, text="🎨 Mở trình chỉnh sửa chữ (kéo thả như CapCut)",
+        bar.add(ttk.Button(bar, text="🎨 Mở trình chỉnh sửa chữ & blur (kéo thả như CapCut)",
                            command=self._open_text_editor))
-        bar.add(ttk.Button(bar, text="🗑 Xóa hết chữ", command=self._clear_text_layers))
+        bar.add(ttk.Button(bar, text="🗑 Xóa hết chữ & blur", command=self._clear_text_layers))
 
         self.text_summary_var = tk.StringVar()
         summary = ttk.Label(parent, textvariable=self.text_summary_var, justify="left")
@@ -637,9 +638,9 @@ class AudioMergeTab(ttk.Frame):
 
     def _refresh_text_summary(self):
         if not self.text_layers:
-            self.text_summary_var.set("Chưa có chữ nào. Bấm \"Mở trình chỉnh sửa chữ\" để thêm.")
+            self.text_summary_var.set("Chưa có chữ/blur nào. Bấm \"Mở trình chỉnh sửa chữ & blur\" để thêm.")
             return
-        lines = [f"Có {len(self.text_layers)} lớp chữ:"]
+        lines = [f"Có {len(self.text_layers)} lớp (chữ / blur):"]
         lines += ["   " + layer_summary(i, layer) for i, layer in enumerate(self.text_layers[:8])]
         if len(self.text_layers) > 8:
             lines.append(f"   ... và {len(self.text_layers) - 8} lớp nữa")
@@ -654,7 +655,7 @@ class AudioMergeTab(ttk.Frame):
     def _clear_text_layers(self):
         if not self.text_layers:
             return
-        if messagebox.askyesno(APP_TITLE, "Xóa toàn bộ các lớp chữ đã tạo?", parent=self):
+        if messagebox.askyesno(APP_TITLE, "Xóa toàn bộ các lớp chữ & blur đã tạo?", parent=self):
             self.text_layers = []
             self.text_enabled_var.set(False)
             self._refresh_text_summary()
@@ -718,33 +719,6 @@ class AudioMergeTab(ttk.Frame):
         save_config(self.cfg)
 
     def _build_tab_advanced(self, parent):
-        wm_row = ttk.Frame(parent)
-        wm_row.pack(fill="x")
-        self.watermark_enabled_var = tk.BooleanVar(
-            value=bool(self.cfg.get("merge_watermark_enabled", False))
-        )
-        ttk.Checkbutton(
-            wm_row, text="Chèn watermark/logo", variable=self.watermark_enabled_var,
-        ).pack(side="left")
-        self.watermark_path_var = tk.StringVar(value=self.cfg.get("merge_watermark_path", ""))
-        ttk.Entry(wm_row, textvariable=self.watermark_path_var, width=40, state="readonly").pack(
-            side="left", padx=(10, 6)
-        )
-        ttk.Button(wm_row, text="Chọn ảnh...", command=self._choose_watermark).pack(side="left")
-
-        wm_row2 = ttk.Frame(parent)
-        wm_row2.pack(fill="x", pady=(6, 0))
-        ttk.Label(wm_row2, text="Độ mờ watermark:").pack(side="left")
-        self.watermark_opacity_var = tk.IntVar(
-            value=int(self.cfg.get("merge_watermark_opacity", 80))
-        )
-        ttk.Spinbox(
-            wm_row2, from_=0, to=100, textvariable=self.watermark_opacity_var, width=5
-        ).pack(side="left", padx=(6, 4))
-        ttk.Label(wm_row2, text="% (watermark hiện ở góc dưới phải)").pack(side="left")
-
-        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=10)
-
         ffmpeg_row = ttk.Frame(parent)
         ffmpeg_row.pack(fill="x")
         ttk.Label(ffmpeg_row, text="ffmpeg:").pack(side="left")
@@ -890,17 +864,6 @@ class AudioMergeTab(ttk.Frame):
             self.output_dir = Path(chosen)
             self.output_dir_var.set(chosen)
             self.cfg["merge_output_dir"] = chosen
-            save_config(self.cfg)
-
-    def _choose_watermark(self):
-        chosen = filedialog.askopenfilename(
-            title="Chọn ảnh watermark/logo (PNG nên có nền trong suốt)",
-            filetypes=[("Ảnh", "*.png *.jpg *.jpeg *.webp"), ("Tất cả", "*.*")],
-            parent=self,
-        )
-        if chosen:
-            self.watermark_path_var.set(chosen)
-            self.cfg["merge_watermark_path"] = chosen
             save_config(self.cfg)
 
     def _choose_ffmpeg(self):
@@ -1284,12 +1247,6 @@ class AudioMergeTab(ttk.Frame):
         if aspect_value == "custom":
             aspect_value = (int(self.custom_w_var.get()), int(self.custom_h_var.get()))
 
-        watermark_path = None
-        if self.watermark_enabled_var.get() and self.watermark_path_var.get().strip():
-            p = Path(self.watermark_path_var.get().strip())
-            if p.is_file():
-                watermark_path = p
-
         return dict(
             target_short_side=RESOLUTION_OPTIONS.get(self.resolution_var.get()),
             no_upscale=bool(self.no_upscale_var.get()),
@@ -1300,8 +1257,6 @@ class AudioMergeTab(ttk.Frame):
             loop_audio=bool(self.loop_audio_var.get()),
             normalize_loudness=bool(self.normalize_var.get()),
             fade_seconds=float(self.fade_seconds_var.get()) if self.fade_enabled_var.get() else 0.0,
-            watermark_path=watermark_path,
-            watermark_opacity=int(self.watermark_opacity_var.get()),
             text_overlay=self._gather_text_overlay(),
             trim_start=max(0.0, float(self.trim_start_var.get())),
             trim_end=max(0.0, float(self.trim_end_var.get())),
@@ -1334,17 +1289,20 @@ class AudioMergeTab(ttk.Frame):
         tắt. Raise OverlayConfigError với thông báo rõ ràng nếu chưa dùng được."""
         if not self.text_enabled_var.get():
             return None
-        layers = [normalize_layer(x) for x in self.text_layers if str(x.get("text", "")).strip()]
+        # Lớp blur không có chữ nhưng vẫn hợp lệ; lớp chữ trống thì bỏ qua.
+        layers = [normalize_layer(x) for x in self.text_layers
+                  if is_blur_layer(x) or str(x.get("text", "")).strip()]
         if not layers:
             raise OverlayConfigError(
-                "Bạn đã bật \"Chèn chữ\" nhưng chưa có lớp chữ nào có nội dung. Hãy bấm "
-                "\"Mở trình chỉnh sửa chữ\" (tab Chèn chữ) để thêm chữ."
+                "Bạn đã bật \"Chèn chữ / blur\" nhưng chưa có lớp nào dùng được (chữ trống). "
+                "Hãy bấm \"Mở trình chỉnh sửa chữ & blur\" (tab Chèn chữ & Blur) để thêm chữ hoặc blur."
             )
-        if self.ffmpeg_path and not ffmpeg_has_filter(self.ffmpeg_path, "drawtext"):
+        has_text = any(not is_blur_layer(x) for x in layers)
+        if has_text and self.ffmpeg_path and not ffmpeg_has_filter(self.ffmpeg_path, "drawtext"):
             raise OverlayConfigError(
                 "Bản ffmpeg đang dùng không hỗ trợ chèn chữ (thiếu bộ lọc drawtext / "
                 "libfreetype). Hãy tải bản ffmpeg \"full\" (VD: gyan.dev) rồi chọn lại ở "
-                "tab Watermark & Nâng cao."
+                "tab Nâng cao."
             )
         native_align = bool(
             self.ffmpeg_path and ffmpeg_filter_has_option(self.ffmpeg_path, "drawtext", "text_align")
@@ -1360,6 +1318,9 @@ class AudioMergeTab(ttk.Frame):
 
         result = []
         for i, layer in enumerate(layers, 1):
+            if is_blur_layer(layer):
+                result.append(dict(layer))      # blur không cần font/chữ
+                continue
             custom = layer["font"].strip()
             if custom and not Path(custom).is_file():
                 raise OverlayConfigError(f"Lớp chữ {i}: không tìm thấy file font\n{custom}")
@@ -1396,8 +1357,8 @@ class AudioMergeTab(ttk.Frame):
         self.cfg["merge_normalize"] = bool(self.normalize_var.get())
         self.cfg["merge_fade_enabled"] = bool(self.fade_enabled_var.get())
         self.cfg["merge_fade_seconds"] = float(self.fade_seconds_var.get())
-        self.cfg["merge_watermark_enabled"] = bool(self.watermark_enabled_var.get())
-        self.cfg["merge_watermark_opacity"] = int(self.watermark_opacity_var.get())
+        for old_key in ("merge_watermark_enabled", "merge_watermark_path", "merge_watermark_opacity"):
+            self.cfg.pop(old_key, None)    # tính năng watermark đã bỏ
         self.cfg["merge_export_csv"] = bool(self.export_csv_var.get())
         self.cfg["merge_preview_seconds"] = int(self.preview_seconds)
         self.cfg["merge_bg_music_enabled"] = bool(self.bg_music_enabled_var.get())

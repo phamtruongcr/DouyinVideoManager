@@ -18,6 +18,12 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
+# UA di động: dùng khi đọc trang chia sẻ video đơn lẻ của Douyin (iesdouyin.com)
+MOBILE_USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+)
+
 REQUEST_TIMEOUT = 15
 PAGE_COUNT = 20          # số video mỗi lần gọi API
 REQUEST_DELAY = 0.6      # giãn cách giữa các request để tránh bị chặn

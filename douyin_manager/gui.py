@@ -2,7 +2,8 @@
 gui.py
 ======
 Cửa sổ chính của ứng dụng (class DouyinApp), gồm 2 TAB:
-  1. "Tải video Douyin": nạp danh sách video, chọn/bỏ chọn, dịch tiêu đề,
+  1. "Tải video Douyin": nạp danh sách video (kênh Douyin/TikTok/Facebook HOẶC
+     dán link video đơn lẻ — 1 hay nhiều link), chọn/bỏ chọn, dịch tiêu đề,
      xóa khỏi danh sách, xuất TXT/Excel, tải video (đơn lẻ / hàng loạt).
      Bố cục từ trên xuống: Nguồn dữ liệu -> Cài đặt -> Hành động + Bảng -> Tiến độ.
   2. "Ghép Audio vào Video": xem audio_merge_gui.AudioMergeTab.
@@ -22,6 +23,7 @@ import requests
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
+from .ui_icons import ICON_COLORS, ICON_DISABLED, Tooltip, make_photo
 from .config import (
     APP_TITLE,
     load_config,
@@ -45,8 +47,18 @@ from .config import (
 )
 from .audio_merge_gui import AudioMergeTab
 from .douyin_client import DouyinAPIError, DouyinClient, DownloadCancelled
+from .tiktok_client import TikTokAPIError, TikTokClient
+from .facebook_client import FacebookAPIError, FacebookClient
+from .audio_merger import find_ffmpeg
+from .browser_cookies import (
+    BROWSERS as COOKIE_BROWSERS, BrowserCookieError, read_cookie_strings, list_profiles,
+)
 from .gemini_translator import translate_batch_with_gemini, list_available_models
-from .utils import extract_clean_link, resolve_link, format_post_time, safe_filename, unique_filename
+from .utils import (
+    extract_all_links, resolve_link, resolve_tiktok_link, resolve_facebook_link,
+    detect_platform,
+    format_post_time, safe_filename, unique_filename,
+)
 from .widgets import AccentButton, WrapFrame, SegmentedTabs
 from . import theme
 
@@ -74,6 +86,17 @@ class DouyinApp(tk.Tk):
 
         self.cfg = load_config()
         self.client = DouyinClient(cookie=self.cfg.get("cookie", ""))
+        # TikTok dùng yt-dlp; cookie TikTok là TÙY CHỌN (cần cho kênh bị chặn/riêng tư)
+        self.tiktok_client = TikTokClient(cookie=self.cfg.get("tiktok_cookie", ""))
+        # Facebook cũng dùng yt-dlp; cookie là TÙY CHỌN (cần cho video riêng tư/giới hạn)
+        self.facebook_client = FacebookClient(cookie=self.cfg.get("facebook_cookie", ""))
+        # Tự lấy Cookie từ trình duyệt đang đăng nhập (xem browser_cookies.py)
+        self.cookie_browser = self.cfg.get("cookie_browser", "firefox")
+        if self.cookie_browser not in COOKIE_BROWSERS:
+            self.cookie_browser = "firefox"
+        self.auto_cookie = bool(self.cfg.get("auto_cookie", False))
+        # Profile trình duyệt (vd "Default", "Profile 1"); rỗng = profile mặc định
+        self.cookie_profile = str(self.cfg.get("cookie_profile", "") or "")
         self.gemini_api_key = self.cfg.get("gemini_api_key", "")
         self.gemini_model = self.cfg.get("gemini_model", DEFAULT_GEMINI_MODEL) or DEFAULT_GEMINI_MODEL
         self.gemini_fallback_model = self.cfg.get(
@@ -222,7 +245,11 @@ class DouyinApp(tk.Tk):
         source.columnconfigure(0, weight=1)
 
         ttk.Label(
-            source, text="Link kênh Douyin (có thể dán cả đoạn text lộn xộn)"
+            source,
+            text=(
+                "Link kênh HOẶC link video đơn lẻ — Douyin / TikTok / Facebook "
+                "(dán nhiều link video: mỗi link 1 dòng/cách nhau; có thể dán cả đoạn text lộn xộn)"
+            ),
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(source, text="Số lượng video muốn lấy").grid(
             row=0, column=1, sticky="w", padx=(10, 0)
@@ -257,7 +284,7 @@ class DouyinApp(tk.Tk):
         )
         ttk.Label(
             source,
-            text="Số lượng: để trống = lấy tất cả, tính từ video MỚI NHẤT trở về.",
+            text="Số lượng (chỉ áp dụng cho link kênh): để trống = lấy tất cả, tính từ video MỚI NHẤT trở về.",
             style="Muted.TLabel",
         ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
@@ -454,8 +481,8 @@ class DouyinApp(tk.Tk):
         self.tree.heading("duration", text="Thời lượng")
         self.tree.heading("post_time", text="Ngày đăng")
         self.tree.heading("status", text="Trạng thái")
-        self.tree.heading("download", text="Tải về")
-        self.tree.heading("log", text="Log")
+        self.tree.heading("download", text="Tải")
+        self.tree.heading("log", text="Xem")
         self.tree.heading("edit", text="Sửa")
         self.tree.heading("delete", text="Xóa")
 
@@ -466,7 +493,7 @@ class DouyinApp(tk.Tk):
         self.tree.column("duration", width=80, anchor="center", stretch=False)
         self.tree.column("post_time", width=120, anchor="center", stretch=False)
         self.tree.column("status", width=110, anchor="center", stretch=False)
-        self.tree.column("download", width=64, anchor="center", stretch=False)
+        self.tree.column("download", width=54, anchor="center", stretch=False)
         self.tree.column("log", width=54, anchor="center", stretch=False)
         self.tree.column("edit", width=54, anchor="center", stretch=False)
         self.tree.column("delete", width=54, anchor="center", stretch=False)
@@ -510,6 +537,7 @@ class DouyinApp(tk.Tk):
         else:
             self._select_bg, self._select_fg = "#bcd8f8", "#000000"
         style.configure("Treeview.Heading", font=("", 9, "bold"))
+        style.configure("Treeview", rowheight=28)  # hàng cao hơn cho vừa icon
         style.map(
             "Treeview",
             background=[("selected", self._select_bg)],
@@ -534,112 +562,295 @@ class DouyinApp(tk.Tk):
 
     # ------------------------------------------------------------ Cài đặt --
     def open_settings(self):
+        """Cửa sổ Cài đặt gọn: 2 tab ("Quản lý Cookie" | "Cấu hình Gemini API"),
+        ghi chú dài chuyển thành tooltip ⓘ, ô cookie 1 dòng, Lưu/Hủy ở đáy."""
         win = tk.Toplevel(self)
         win.title("Cài đặt")
-        # Chiều cao tự co theo màn hình để nút "Lưu" luôn nằm trong tầm nhìn.
-        win.geometry(f"560x{min(760, max(420, self.winfo_screenheight() - 120))}")
-        win.minsize(480, 380)
+        win.geometry("800x460")
+        win.minsize(720, 420)
         win.transient(self)
+        win.bind("<Escape>", lambda e: win.destroy())
 
-        ttk.Label(
-            win,
-            text=(
-                "Dán Cookie của trang douyin.com (lấy từ trình duyệt đã mở "
-                "douyin.com — xem README.md để biết cách lấy).\n"
-                "Cookie giúp app lấy được danh sách video ổn định hơn."
-            ),
-            wraplength=520,
-            justify="left",
-        ).pack(anchor="w", padx=10, pady=(0, 4))
+        # ---- Đáy: Hủy | Lưu (pack TRƯỚC nên luôn hiện đủ) ----
+        btn_row = ttk.Frame(win)
+        btn_row.pack(side="bottom", fill="x", padx=12, pady=(4, 10))
 
-        text = tk.Text(win, height=6, wrap="word")
-        text.insert("1.0", self.client.cookie)
-        text.pack(fill="both", expand=True, padx=10, pady=4)
+        tabs = SegmentedTabs(win, variant="sub")
+        tabs.pack(side="top", fill="both", expand=True, padx=12, pady=(10, 0))
+        tab_cookie = ttk.Frame(tabs, padding=(2, 4))
+        tab_gemini = ttk.Frame(tabs, padding=(2, 4))
+        tabs.add(tab_cookie, text="🍪  Quản lý Cookie")
+        tabs.add(tab_gemini, text="✨  Cấu hình Gemini API")
 
-        ttk.Separator(win, orient="horizontal").pack(fill="x", padx=10, pady=8)
+        def info(parent, tip: str):
+            """Biểu tượng ⓘ — rê chuột vào để xem hướng dẫn chi tiết."""
+            lbl = ttk.Label(parent, text="ⓘ", style="Link.TLabel", cursor="question_arrow")
+            Tooltip(lbl, tip, wraplength=360)
+            return lbl
 
-        ttk.Label(
-            win,
-            text=(
-                "Gemini API Key (dùng cho chức năng \"Dịch tiêu đề → Tiếng Việt\").\n"
-                "Lấy miễn phí tại: https://aistudio.google.com/apikey"
-            ),
-            wraplength=520,
-            justify="left",
-        ).pack(anchor="w", padx=10, pady=(0, 4))
+        def link(parent, text: str, url: str):
+            lbl = ttk.Label(parent, text=text, style="Link.TLabel", cursor="hand2")
+            lbl.bind("<Button-1>", lambda e: webbrowser.open(url))
+            return lbl
 
+        # =====================================================================
+        # TAB 1 · QUẢN LÝ COOKIE
+        # =====================================================================
+        # --- 1a. Tự lấy Cookie từ trình duyệt (đưa lên đầu: tiện nhất) ---
+        auto_box = ttk.LabelFrame(tab_cookie, text=" Tự lấy Cookie từ trình duyệt ", padding=8)
+        auto_box.pack(fill="x")
+
+        row = ttk.Frame(auto_box)
+        row.pack(fill="x")
+        ttk.Label(row, text="Trình duyệt:").pack(side="left")
+        browser_var = tk.StringVar(value=self.cookie_browser)
+        browser_combo = ttk.Combobox(
+            row, textvariable=browser_var, values=COOKIE_BROWSERS, state="readonly", width=9,
+        )
+        browser_combo.pack(side="left", padx=(6, 10))
+
+        ttk.Label(row, text="Profile:").pack(side="left")
+        profile_var = tk.StringVar()
+        profile_combo = ttk.Combobox(row, textvariable=profile_var, width=18)
+        profile_combo.pack(side="left", padx=(6, 10))
+        Tooltip(
+            profile_combo,
+            "Profile của trình duyệt (Chrome/Edge/Brave... có thể có nhiều profile). "
+            "Chọn profile mà bạn ĐÃ ĐĂNG NHẬP. Xem tên thư mục tại chrome://version "
+            "→ dòng \"Profile Path\".",
+            wraplength=320,
+        )
+
+        grab_btn = ttk.Button(row, text="🍪 Lấy Cookie ngay")
+        grab_btn.pack(side="left")
+
+        auto_cookie_var = tk.BooleanVar(value=self.auto_cookie)
+        ttk.Checkbutton(
+            row, text="Tự lấy lại mỗi lần Lấy danh sách", variable=auto_cookie_var,
+        ).pack(side="left", padx=(14, 4))
+        info(
+            row,
+            "Bật: mỗi lần bấm \"Lấy danh sách video\", app tự đọc Cookie MỚI từ trình "
+            "duyệt/profile đã chọn nên không bao giờ bị hết hạn.\n"
+            "Firefox đọc ổn định nhất. Chrome/Edge bản mới trên Windows có thể không đọc "
+            "được (cookie mã hóa app-bound) — khi đó hãy dán Cookie thủ công bên dưới.",
+        ).pack(side="left")
+
+        grab_result_var = tk.StringVar(value="")
+        grab_result_lbl = ttk.Label(
+            auto_box, textvariable=grab_result_var, style="Muted.TLabel",
+            wraplength=720, justify="left",
+        )
+        # chỉ hiện khi có kết quả -> không chiếm chỗ lúc chưa dùng
+        def set_grab_result(msg: str):
+            grab_result_var.set(msg)
+            if msg:
+                grab_result_lbl.pack(fill="x", pady=(6, 0))
+            else:
+                grab_result_lbl.pack_forget()
+
+        # --- Profile: dò danh sách theo trình duyệt đang chọn ---
+        def profile_label(folder: str, name: str) -> str:
+            return folder if name == folder else f"{folder}  ({name})"
+
+        def refresh_profiles(*_):
+            found_profiles = list_profiles(browser_var.get())
+            labels = ["(Mặc định)"] + [profile_label(f, n) for f, n in found_profiles]
+            profile_combo["values"] = labels
+            saved = self.cookie_profile if browser_var.get() == self.cookie_browser else ""
+            match = next((l for l in labels[1:] if l.split("  (")[0] == saved), None)
+            profile_var.set(match or saved or labels[0])
+
+        def selected_profile() -> str:
+            """Tên thư mục profile đã chọn ('' = mặc định). Cho phép tự gõ tay."""
+            v = profile_var.get().strip()
+            if not v or v == "(Mặc định)":
+                return ""
+            return v.split("  (")[0].strip()
+
+        browser_combo.bind("<<ComboboxSelected>>", refresh_profiles)
+        refresh_profiles()
+
+        # --- 1b. Cookie thủ công: mỗi nền tảng 1 ô 1 dòng (ẩn bằng •) ---
+        manual_box = ttk.LabelFrame(tab_cookie, text=" Dán Cookie thủ công ", padding=8)
+        manual_box.pack(fill="x", pady=(10, 0))
+        manual_box.columnconfigure(2, weight=1)
+
+        cookie_entries: dict[str, ttk.Entry] = {}
+        manual_rows = (
+            ("douyin", "Douyin", self.client.cookie,
+             "Cookie của douyin.com (lấy từ trình duyệt đã mở douyin.com — xem "
+             "README.md). Giúp app lấy danh sách video ổn định hơn.",
+             ("Mở douyin.com ↗", "https://www.douyin.com")),
+            ("tiktok", "TikTok", self.tiktok_client.cookie,
+             "TÙY CHỌN — chỉ cần khi kênh TikTok bị chặn/riêng tư. Dán Cookie của "
+             "tiktok.com đã đăng nhập, dạng a=1; b=2.",
+             ("Mở tiktok.com ↗", "https://www.tiktok.com")),
+            ("facebook", "Facebook", self.facebook_client.cookie,
+             "TÙY CHỌN — chỉ cần khi video riêng tư/giới hạn hoặc Facebook đòi đăng "
+             "nhập. Dán Cookie của facebook.com đã đăng nhập (cần có c_user và xs).",
+             ("Mở facebook.com ↗", "https://www.facebook.com")),
+        )
+        for r, (key, label, value, tip, (link_text, link_url)) in enumerate(manual_rows):
+            ttk.Label(manual_box, text=label, width=9).grid(row=r, column=0, sticky="w", pady=3)
+            info(manual_box, tip).grid(row=r, column=1, sticky="w", padx=(0, 8))
+            entry = ttk.Entry(manual_box, show="•")
+            entry.insert(0, value)
+            entry.grid(row=r, column=2, sticky="ew", pady=3)
+            link(manual_box, link_text, link_url).grid(row=r, column=3, sticky="w", padx=(10, 0))
+            cookie_entries[key] = entry
+
+        show_cookie_var = tk.BooleanVar(value=False)
+
+        def toggle_show():
+            for e in cookie_entries.values():
+                e.configure(show="" if show_cookie_var.get() else "•")
+
+        ttk.Checkbutton(
+            manual_box, text="Hiện nội dung Cookie", variable=show_cookie_var,
+            command=toggle_show,
+        ).grid(row=len(manual_rows), column=2, sticky="w", pady=(4, 0))
+
+        # --- Hành vi nút "Lấy Cookie ngay" ---
+        def grab_cookies():
+            grab_btn.state(["disabled"])
+            set_grab_result("Đang đọc Cookie từ trình duyệt...")
+            browser = browser_var.get()
+            profile = selected_profile() or None
+            # Luồng nền KHÔNG được đụng vào widget Tk -> chỉ bỏ kết quả vào
+            # hàng đợi; luồng giao diện tự đọc ra bằng after() bên dưới.
+            result_q: queue.Queue = queue.Queue()
+
+            def worker():
+                try:
+                    result_q.put((read_cookie_strings(browser, profile), None))
+                except BrowserCookieError as exc:
+                    result_q.put(({}, str(exc)))
+                except Exception as exc:  # lỗi bất ngờ vẫn phải mở lại nút
+                    result_q.put(({}, f"Lỗi không xác định: {exc}"))
+
+            def apply(found, err):
+                grab_btn.state(["!disabled"])
+                if err:
+                    set_grab_result("❌ " + err)
+                    return
+                where = browser + (" / " + profile if profile else "")
+                parts = []
+                for key, label in (("douyin", "Douyin"), ("tiktok", "TikTok"), ("facebook", "Facebook")):
+                    if key in found:
+                        cookie_entries[key].delete(0, "end")
+                        cookie_entries[key].insert(0, found[key])
+                        parts.append(f"✔ {label}: {found[key].count(';') + 1} cookie")
+                    else:
+                        parts.append(f"✘ {label}: không có (hãy đăng nhập trong {where})")
+                set_grab_result("   ".join(parts) + "\nBấm Lưu để áp dụng.")
+
+            def poll():
+                if not win.winfo_exists():
+                    return
+                try:
+                    found, err = result_q.get_nowait()
+                except queue.Empty:
+                    win.after(100, poll)
+                    return
+                apply(found, err)
+
+            threading.Thread(target=worker, daemon=True).start()
+            win.after(100, poll)
+
+        grab_btn.configure(command=grab_cookies)
+
+        # =====================================================================
+        # TAB 2 · CẤU HÌNH GEMINI API
+        # =====================================================================
+        tab_gemini.columnconfigure(0, weight=1, uniform="model")
+        tab_gemini.columnconfigure(1, weight=1, uniform="model")
+
+        key_head = ttk.Frame(tab_gemini)
+        key_head.grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(key_head, text="Gemini API Key").pack(side="left")
+        info(
+            key_head,
+            "Dùng cho chức năng \"Dịch tiêu đề → Tiếng Việt\". Key được lưu trong file "
+            "cấu hình trên máy bạn.",
+        ).pack(side="left", padx=(6, 0))
+
+        key_row = ttk.Frame(tab_gemini)
+        key_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        key_row.columnconfigure(0, weight=1)
         gemini_var = tk.StringVar(value=self.gemini_api_key)
-        gemini_entry = ttk.Entry(win, textvariable=gemini_var, show="•")
-        gemini_entry.pack(fill="x", padx=10, pady=(0, 4))
+        gemini_entry = ttk.Entry(key_row, textvariable=gemini_var, show="•")
+        gemini_entry.grid(row=0, column=0, sticky="ew")
+        fetch_models_btn = ttk.Button(key_row, text="⟳ Tải danh sách model")
+        fetch_models_btn.grid(row=0, column=1, padx=(8, 0))
+        # Huy hiệu trạng thái: xanh lá = thành công, đỏ = lỗi (chi tiết trong tooltip)
+        model_badge = tk.Label(key_row, text="", fg="#ffffff", padx=8, pady=2, font=("", 9))
+        model_badge_tip = Tooltip(model_badge, "", wraplength=360)
+        model_badge.grid(row=0, column=2, padx=(8, 0))
+        model_badge.grid_remove()
 
-        model_status_var = tk.StringVar(value="")
-        fetch_models_btn = ttk.Button(
-            win, text="⟳ Tải danh sách model khả dụng từ Gemini"
-        )
-        fetch_models_btn.pack(anchor="w", padx=10, pady=(0, 2))
-        ttk.Label(
-            win,
-            textvariable=model_status_var,
-            style="Muted.TLabel",
-            wraplength=520,
-            justify="left",
-        ).pack(anchor="w", padx=10, pady=(0, 8))
+        link(
+            tab_gemini, "Lấy API Key miễn phí tại aistudio.google.com ↗",
+            "https://aistudio.google.com/apikey",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 12))
 
-        ttk.Label(
-            win,
-            text=(
-                "Model chính (bấm nút trên để lấy TẤT CẢ model đang khả dụng cho "
-                "đúng API Key này, hoặc tự gõ tên model khác):"
-            ),
-            wraplength=520,
-            justify="left",
-        ).pack(anchor="w", padx=10, pady=(0, 2))
+        # --- Model chính | Model dự phòng: 2 cột song song ---
+        main_head = ttk.Frame(tab_gemini)
+        main_head.grid(row=3, column=0, sticky="w")
+        ttk.Label(main_head, text="Model chính").pack(side="left")
+        info(
+            main_head,
+            "Bấm \"Tải danh sách model\" để lấy TẤT CẢ model đang khả dụng cho đúng API "
+            "Key này, hoặc tự gõ tên model khác.",
+        ).pack(side="left", padx=(6, 0))
+
+        fb_head = ttk.Frame(tab_gemini)
+        fb_head.grid(row=3, column=1, sticky="w", padx=(12, 0))
+        ttk.Label(fb_head, text="Model dự phòng").pack(side="left")
+        info(
+            fb_head,
+            "Tự động chuyển sang model này khi model chính lỗi/quá tải/hết quota phút. "
+            "Để TRỐNG để tắt fallback.",
+        ).pack(side="left", padx=(6, 0))
+
         model_var = tk.StringVar(value=self.gemini_model)
-        model_combo = ttk.Combobox(
-            win, textvariable=model_var, values=GEMINI_MODEL_SUGGESTIONS
-        )
-        model_combo.pack(fill="x", padx=10, pady=(0, 8))
-
-        ttk.Label(
-            win,
-            text=(
-                "Model dự phòng (tự động chuyển sang khi model chính lỗi/quá tải/"
-                "hết quota phút; để TRỐNG để tắt fallback):"
-            ),
-            wraplength=520,
-            justify="left",
-        ).pack(anchor="w", padx=10, pady=(0, 2))
+        model_combo = ttk.Combobox(tab_gemini, textvariable=model_var, values=GEMINI_MODEL_SUGGESTIONS)
+        model_combo.grid(row=4, column=0, sticky="ew", pady=(3, 0))
         fallback_model_var = tk.StringVar(value=self.gemini_fallback_model)
         fallback_model_combo = ttk.Combobox(
-            win, textvariable=fallback_model_var, values=[""] + GEMINI_MODEL_SUGGESTIONS
+            tab_gemini, textvariable=fallback_model_var, values=[""] + GEMINI_MODEL_SUGGESTIONS,
         )
-        fallback_model_combo.pack(fill="x", padx=10, pady=(0, 8))
+        fallback_model_combo.grid(row=4, column=1, sticky="ew", padx=(12, 0), pady=(3, 0))
+
+        def show_badge(text: str, ok: bool, detail: str = ""):
+            model_badge.configure(text=text, bg=theme.TICK_GREEN_DIM if ok else theme.RED)
+            model_badge_tip.text = detail
+            model_badge.grid()
 
         def on_models_success(models: list[str]):
             fetch_models_btn.state(["!disabled"])
             if not models:
-                model_status_var.set(
-                    "Gemini không trả về model nào hỗ trợ dịch text cho API Key này."
+                show_badge(
+                    "✘ Không có model", False,
+                    "Gemini không trả về model nào hỗ trợ dịch text cho API Key này.",
                 )
                 return
             model_combo["values"] = models
             fallback_model_combo["values"] = [""] + models
-            model_status_var.set(
-                f"Đã tải {len(models)} model khả dụng cho API Key này — chọn trong danh sách bên dưới."
-            )
+            show_badge(f"✔ Đã tải {len(models)} model", True, "Chọn model trong 2 danh sách bên dưới.")
 
         def on_models_error(msg: str):
             fetch_models_btn.state(["!disabled"])
-            model_status_var.set(f"Không tải được danh sách model: {msg}")
+            show_badge("✘ Lỗi tải model", False, f"Không tải được danh sách model: {msg}")
 
         def fetch_models():
             api_key = gemini_var.get().strip()
             if not api_key:
                 messagebox.showwarning(
-                    APP_TITLE, "Nhập Gemini API Key trước khi tải danh sách model."
+                    APP_TITLE, "Nhập Gemini API Key trước khi tải danh sách model.", parent=win,
                 )
                 return
-            model_status_var.set("Đang tải danh sách model từ Gemini...")
+            model_badge.grid_remove()
             fetch_models_btn.state(["disabled"])
 
             def worker():
@@ -659,16 +870,25 @@ class DouyinApp(tk.Tk):
         if self.gemini_api_key:
             win.after(200, fetch_models)
 
-
-        # Hàng nút "Lưu" được ghim ở ĐÁY (pack trước mọi widget khác) nên luôn
-        # hiện đủ dù cửa sổ bị thu nhỏ; ô Cookie ở trên tự co giãn theo.
-        btn_row = ttk.Frame(win)
-        first_widget = win.pack_slaves()[0]
-        btn_row.pack(side="bottom", fill="x", padx=10, pady=8, before=first_widget)
-
+        # =====================================================================
+        # ĐÁY: Hủy | Lưu
+        # =====================================================================
         def save_and_close():
-            self.client.cookie = text.get("1.0", "end").strip()
+            self.client.cookie = cookie_entries["douyin"].get().strip()
             self.cfg["cookie"] = self.client.cookie
+
+            self.tiktok_client.cookie = cookie_entries["tiktok"].get().strip()
+            self.cfg["tiktok_cookie"] = self.tiktok_client.cookie
+
+            self.facebook_client.cookie = cookie_entries["facebook"].get().strip()
+            self.cfg["facebook_cookie"] = self.facebook_client.cookie
+
+            self.cookie_browser = browser_var.get()
+            self.auto_cookie = bool(auto_cookie_var.get())
+            self.cfg["cookie_browser"] = self.cookie_browser
+            self.cookie_profile = selected_profile()
+            self.cfg["cookie_profile"] = self.cookie_profile
+            self.cfg["auto_cookie"] = self.auto_cookie
 
             self.gemini_api_key = gemini_var.get().strip()
             self.cfg["gemini_api_key"] = self.gemini_api_key
@@ -685,17 +905,11 @@ class DouyinApp(tk.Tk):
             save_config(self.cfg)
             win.destroy()
 
-        ttk.Button(btn_row, text="Lưu", command=save_and_close).pack(side="right")
-        ttk.Button(
-            btn_row,
-            text="Mở douyin.com để lấy Cookie",
-            command=lambda: webbrowser.open("https://www.douyin.com"),
-        ).pack(side="right", padx=(0, 6))
-        ttk.Button(
-            btn_row,
-            text="Lấy Gemini API Key",
-            command=lambda: webbrowser.open("https://aistudio.google.com/apikey"),
-        ).pack(side="right", padx=(0, 6))
+        AccentButton(
+            btn_row, text="Lưu", command=save_and_close,
+            bg=theme.ACCENT, hover_bg=theme.ACCENT_HOVER, padx=22, pady=5,
+        ).pack(side="right")
+        ttk.Button(btn_row, text="Hủy", command=win.destroy).pack(side="right", padx=(0, 8))
 
     def on_choose_folder(self):
         chosen = filedialog.askdirectory(initialdir=str(self.download_dir))
@@ -842,14 +1056,16 @@ class DouyinApp(tk.Tk):
         if self.is_busy:
             return
         raw = self.link_var.get().strip()
-        clean = extract_clean_link(raw)
-        if not clean:
+        links = extract_all_links(raw)
+        if not links:
             messagebox.showwarning(
-                APP_TITLE, "Không tìm thấy link Douyin hợp lệ trong nội dung đã nhập."
+                APP_TITLE,
+                "Không tìm thấy link Douyin, TikTok hoặc Facebook hợp lệ trong nội dung đã nhập.",
             )
             return
-        # cập nhật lại ô nhập bằng link đã làm sạch, đúng yêu cầu đề bài
-        self.link_var.set(clean)
+        # cập nhật lại ô nhập bằng link đã làm sạch (nhiều link -> cách nhau bằng dấu cách)
+        clean = links[0]
+        self.link_var.set("  ".join(links))
 
         qty_raw = self.max_items_var.get().strip()
         max_items = 0
@@ -876,11 +1092,116 @@ class DouyinApp(tk.Tk):
         self.status_var.set(f"Đang phân giải link: {clean}")
         self.download_btn.state(["disabled"])
 
-        threading.Thread(
-            target=self._load_worker, args=(clean, max_items), daemon=True
-        ).start()
+        if len(links) > 1:
+            # Nhiều link dán cùng lúc -> coi là danh sách video đơn lẻ
+            threading.Thread(
+                target=self._load_single_worker, args=(links,), daemon=True
+            ).start()
+        else:
+            threading.Thread(
+                target=self._load_worker, args=(clean, max_items), daemon=True
+            ).start()
+
+    def _auto_refresh_cookies(self, platform: str):
+        """Nếu bật "Tự lấy lại Cookie": đọc cookie mới từ trình duyệt đã chọn
+        cho `platform` ("douyin"/"tiktok") và cập nhật vào client + config.
+        Lỗi/không có cookie -> giữ nguyên cookie cũ, chỉ báo ở thanh trạng thái.
+        Chạy trong luồng nền (đọc trình duyệt có thể mất vài giây)."""
+        if not self.auto_cookie:
+            return
+        self.task_queue.put(("status", f"Đang lấy Cookie mới từ {self.cookie_browser}..."))
+        try:
+            found = read_cookie_strings(self.cookie_browser, self.cookie_profile or None)
+        except BrowserCookieError as exc:
+            self.task_queue.put(
+                ("status", f"⚠ Không tự lấy được Cookie ({self.cookie_browser}), dùng Cookie đã lưu. {str(exc)[:120]}")
+            )
+            return
+        fresh = found.get(platform)
+        if not fresh:
+            self.task_queue.put(
+                ("status", f"⚠ {self.cookie_browser} chưa có Cookie {platform}, dùng Cookie đã lưu.")
+            )
+            return
+        client = self._client_for(platform)
+        client.cookie = fresh
+        self.cfg[{"tiktok": "tiktok_cookie", "facebook": "facebook_cookie"}.get(platform, "cookie")] = fresh
+        save_config(self.cfg)
+
+    def _client_for(self, platform: str | None):
+        """Client tương ứng nền tảng ("tiktok" | "facebook" | khác -> Douyin)."""
+        if platform == "tiktok":
+            return self.tiktok_client
+        if platform == "facebook":
+            return self.facebook_client
+        return self.client
+
+    def _fetch_single_item(self, link: str) -> dict:
+        """Lấy thông tin 1 video đơn lẻ (KHÔNG tải về) từ link bất kỳ của 3 nền
+        tảng. Trả về item cùng định dạng với danh sách kênh; raise
+        DouyinAPIError / TikTokAPIError / FacebookAPIError / RuntimeError."""
+        platform = detect_platform(link)
+        if platform == "tiktok":
+            return self.tiktok_client.fetch_video_info(link)
+        if platform == "facebook":
+            kind, _ = resolve_facebook_link(link)
+            if kind != "video":
+                raise RuntimeError("Đây là link trang/kênh Facebook, không phải video đơn lẻ.")
+            return self.facebook_client.fetch_video_info(link)
+        kind, ident = resolve_link(link)
+        if kind != "video":
+            raise RuntimeError("Đây là link kênh Douyin, không phải video đơn lẻ.")
+        return self.client.fetch_video_by_id(ident)
+
+    def _load_single_worker(self, links: list[str]):
+        """Nạp 1 hoặc nhiều link VIDEO ĐƠN LẺ vào bảng (không cần link kênh),
+        tự tick chọn sẵn để chỉ việc bấm "Tải video đã chọn"."""
+        items: list[dict] = []
+        seen: set[str] = set()
+        failures: list[str] = []
+        refreshed: set[str] = set()
+        for i, link in enumerate(links, 1):
+            if self.stop_loading_flag:
+                break
+            platform = detect_platform(link) or "douyin"
+            if platform not in refreshed:
+                refreshed.add(platform)
+                self._auto_refresh_cookies(platform)
+            self.task_queue.put(("status", f"Đang đọc video {i}/{len(links)}: {link}"))
+            try:
+                item = self._fetch_single_item(link)
+            except (DouyinAPIError, TikTokAPIError, FacebookAPIError, RuntimeError) as exc:
+                failures.append(f"• {link}\n  {str(exc).splitlines()[0][:200]}")
+                continue
+            if item["id"] in seen:
+                continue
+            seen.add(item["id"])
+            items.append(item)
+
+        if failures:
+            self.task_queue.put(
+                (
+                    "error",
+                    f"Không đọc được {len(failures)}/{len(links)} link:\n\n" + "\n".join(failures),
+                )
+            )
+        self.task_queue.put(("videos_loaded", items))
+        if items:
+            self.task_queue.put(("check_all", None))
+            self.task_queue.put(
+                ("status", f"Đã nạp {len(items)} video đơn lẻ (đã tick chọn sẵn) — bấm \"Tải video đã chọn\".")
+            )
+        self.task_queue.put(("load_done", None))
 
     def _load_worker(self, link: str, max_items: int = 0):
+        platform = detect_platform(link) or "douyin"
+        self._auto_refresh_cookies(platform)
+        if platform == "tiktok":
+            self._load_worker_tiktok(link, max_items)
+            return
+        if platform == "facebook":
+            self._load_worker_facebook(link, max_items)
+            return
         try:
             kind, ident = resolve_link(link)
         except RuntimeError as exc:
@@ -889,14 +1210,8 @@ class DouyinApp(tk.Tk):
             return
 
         if kind == "video":
-            self.task_queue.put(
-                (
-                    "error",
-                    "Link này là 1 video đơn lẻ, không phải link kênh. "
-                    "Hãy dán link trang cá nhân (dạng douyin.com/user/...).",
-                )
-            )
-            self.task_queue.put(("load_done", None))
+            # Link video đơn lẻ -> nạp thẳng 1 hàng vào bảng thay vì báo lỗi
+            self._load_single_worker([link])
             return
 
         sec_uid = ident
@@ -920,6 +1235,79 @@ class DouyinApp(tk.Tk):
         self.task_queue.put(("videos_loaded", items))
         self.task_queue.put(("load_done", None))
 
+    def _load_worker_tiktok(self, link: str, max_items: int = 0):
+        """Lấy danh sách video của 1 kênh TikTok (qua yt-dlp), đẩy kết quả vào
+        queue đúng như luồng Douyin để phần hiển thị/tải dùng chung."""
+        try:
+            kind, ident = resolve_tiktok_link(link)
+        except RuntimeError as exc:
+            self.task_queue.put(("error", str(exc)))
+            self.task_queue.put(("load_done", None))
+            return
+
+        if kind == "video":
+            self._load_single_worker([link])
+            return
+
+        profile_url = ident
+        self.task_queue.put(("status", f"Đang lấy danh sách video TikTok: {profile_url}"))
+
+        def progress_cb(count):
+            self.task_queue.put(("status", f"Đã lấy {count} video TikTok..."))
+
+        try:
+            items = self.tiktok_client.fetch_all_user_posts(
+                profile_url,
+                stop_flag=lambda: self.stop_loading_flag,
+                progress_cb=progress_cb,
+                max_items=max_items,
+            )
+        except TikTokAPIError as exc:
+            self.task_queue.put(("error", str(exc)))
+            self.task_queue.put(("load_done", None))
+            return
+
+        self.task_queue.put(("videos_loaded", items))
+        if self.tiktok_client.last_warning:
+            self.task_queue.put(("status", "⚠ " + self.tiktok_client.last_warning))
+        self.task_queue.put(("load_done", None))
+
+    def _load_worker_facebook(self, link: str, max_items: int = 0):
+        """Link Facebook: video/reel đơn lẻ -> nạp 1 hàng; trang/kênh -> thử liệt
+        kê video của trang (best-effort qua yt-dlp)."""
+        try:
+            kind, ident = resolve_facebook_link(link)
+        except RuntimeError as exc:
+            self.task_queue.put(("error", str(exc)))
+            self.task_queue.put(("load_done", None))
+            return
+
+        if kind == "video":
+            self._load_single_worker([link])
+            return
+
+        self.task_queue.put(("status", f"Đang lấy danh sách video Facebook: {ident}"))
+
+        def progress_cb(count):
+            self.task_queue.put(("status", f"Đã lấy {count} video Facebook..."))
+
+        try:
+            items = self.facebook_client.fetch_all_user_posts(
+                ident,
+                stop_flag=lambda: self.stop_loading_flag,
+                progress_cb=progress_cb,
+                max_items=max_items,
+            )
+        except FacebookAPIError as exc:
+            self.task_queue.put(("error", str(exc)))
+            self.task_queue.put(("load_done", None))
+            return
+
+        self.task_queue.put(("videos_loaded", items))
+        if self.facebook_client.last_warning:
+            self.task_queue.put(("status", "⚠ " + self.facebook_client.last_warning))
+        self.task_queue.put(("load_done", None))
+
     # --------------------------------------------------------- Poll queue --
     def _poll_queue(self):
         try:
@@ -931,6 +1319,8 @@ class DouyinApp(tk.Tk):
                     messagebox.showerror(APP_TITLE, payload)
                 elif kind == "videos_loaded":
                     self._populate_tree(payload)
+                elif kind == "check_all":
+                    self.set_all_checked(True)
                 elif kind == "load_done":
                     self.is_busy = False
                     self.download_btn.state(["!disabled"])
@@ -967,7 +1357,8 @@ class DouyinApp(tk.Tk):
         if not items:
             self.status_var.set(
                 "Không lấy được video nào. Kiểm tra lại link hoặc cập nhật Cookie ở "
-                "mục Cài đặt."
+                "mục Cài đặt (Douyin cần Cookie Douyin; TikTok/Facebook có thể cần Cookie "
+                "của trang đó hoặc cập nhật yt-dlp; với Facebook hãy thử dán từng link video)."
             )
             return
         for item in items:
@@ -1025,44 +1416,74 @@ class DouyinApp(tk.Tk):
         "delete": ("#ef4444", "#9ca3af"),     # đỏ
     }
 
-    def _create_row_widgets(self, vid: str):
-        """Tạo 4 label dạng LINK (chữ màu, gạch chân, con trỏ tay) đè lên
-        hàng `vid` trong Treeview, thay cho nút bấm thật. Dùng Label thay vì
-        Button vì Button gốc trên macOS (Aqua) không tô được màu nền/chữ
-        tùy ý, còn Label thì hiển thị đúng màu trên mọi hệ điều hành."""
+    # Chú thích (tooltip) cho từng icon
+    _ICON_TIPS = {
+        "download": "Tải video này",
+        "log": "Xem log",
+        "edit": "Sửa tiêu đề",
+        "delete": "Xóa khỏi danh sách",
+    }
+    _ICON_SIZE = 20
 
-        def make_link(key, text, command):
-            color, _ = self._LINK_COLORS[key]
-            lbl = tk.Label(
-                self.tree, text=text, fg=color,
-                bg=self._select_bg if vid in self.tree.selection() else self._row_bg,
-                font=self._link_font, cursor="hand2",
+    def _icon(self, key: str, state: str):
+        """Lấy PhotoImage của icon `key` ở trạng thái normal/hover/disabled.
+        Tạo lười (lần đầu cần) và cache lại; phải giữ tham chiếu để Tk không
+        thu hồi ảnh."""
+        cache = self.__dict__.setdefault("_icon_cache", {})
+        ck = (key, state)
+        if ck not in cache:
+            color = ICON_DISABLED if state == "disabled" else ICON_COLORS[key]
+            cache[ck] = make_photo(
+                key, color, self._ICON_SIZE, hover=(state == "hover"), master=self
             )
+        return cache[ck]
+
+    def _create_row_widgets(self, vid: str):
+        """Tạo 4 nút ICON (Tải / Xem log / Sửa / Xóa) đè lên hàng `vid` trong
+        Treeview. Dùng Label chứa ảnh thay vì Button vì Button gốc trên macOS
+        (Aqua) không tô được nền tùy ý. Rê chuột -> icon sáng lên (nền nhạt),
+        dừng chuột -> hiện tooltip."""
+
+        def make_icon_btn(key, command):
+            lbl = tk.Label(
+                self.tree, image=self._icon(key, "normal"),
+                bg=self._select_bg if vid in self.tree.selection() else self._row_bg,
+                bd=0, padx=0, pady=0, cursor="hand2",
+            )
+            lbl._enabled = True
+            lbl._icon_key = key
             lbl.bind("<Button-1>", lambda e, c=command: c())
+            lbl.bind(
+                "<Enter>",
+                lambda e, l=lbl, k=key: l._enabled and l.config(image=self._icon(k, "hover")),
+            )
+            lbl.bind(
+                "<Leave>",
+                lambda e, l=lbl, k=key: l._enabled and l.config(image=self._icon(k, "normal")),
+            )
+            Tooltip(lbl, self._ICON_TIPS[key])
             return lbl
 
-        dl_lbl = make_link("download", "Tải", lambda v=vid: self.start_single_download(v))
-        log_lbl = make_link("log", "Xem", lambda v=vid: self.show_log_popup(v))
-        edit_lbl = make_link("edit", "Sửa", lambda v=vid: self.edit_title(v))
-        del_lbl = make_link("delete", "Xóa", lambda v=vid: self.delete_single(v))
-
         self.row_widgets[vid] = {
-            "download": dl_lbl, "log": log_lbl, "edit": edit_lbl, "delete": del_lbl,
+            "download": make_icon_btn("download", lambda v=vid: self.start_single_download(v)),
+            "log": make_icon_btn("log", lambda v=vid: self.show_log_popup(v)),
+            "edit": make_icon_btn("edit", lambda v=vid: self.edit_title(v)),
+            "delete": make_icon_btn("delete", lambda v=vid: self.delete_single(v)),
         }
 
     def _set_download_link_enabled(self, vid: str, enabled: bool):
-        """Bật/tắt link Tải của 1 hàng (tắt khi video đó đang tải, tránh
-        bấm trùng)."""
+        """Bật/tắt icon Tải của 1 hàng (xám + không bấm được khi video đó
+        đang tải, tránh bấm trùng)."""
         widgets = self.row_widgets.get(vid)
         if not widgets:
             return
         lbl = widgets["download"]
-        normal_color, disabled_color = self._LINK_COLORS["download"]
+        lbl._enabled = enabled
         if enabled:
-            lbl.config(fg=normal_color, cursor="hand2")
+            lbl.config(image=self._icon("download", "normal"), cursor="hand2")
             lbl.bind("<Button-1>", lambda e, v=vid: self.start_single_download(v))
         else:
-            lbl.config(fg=disabled_color, cursor="arrow")
+            lbl.config(image=self._icon("download", "disabled"), cursor="arrow")
             lbl.unbind("<Button-1>")
 
     def _destroy_row_widgets(self, vid: str):
@@ -1535,9 +1956,16 @@ class DouyinApp(tk.Tk):
                 self.task_queue.put(("video_status", (v, f"Đang tải {kb_done}KB{kb_total}")))
 
             try:
-                self.client.download_video(
+                dl_client = self._client_for(item.get("platform"))
+                extra = {}
+                if item.get("platform") == "facebook":
+                    # ffmpeg để ghép hình + tiếng chất lượng cao (rỗng = không có)
+                    extra["ffmpeg_location"] = find_ffmpeg(
+                        self.cfg.get("merge_ffmpeg_path", "")
+                    ) or ""
+                dl_client.download_video(
                     item["url"], dest, chunk_cb=chunk_cb,
-                    stop_flag=self.download_stop_event.is_set,
+                    stop_flag=self.download_stop_event.is_set, **extra,
                 )
             except DownloadCancelled:
                 # Dừng NGAY GIỮA CHỪNG (không phải đợi tải xong): file
@@ -1558,7 +1986,7 @@ class DouyinApp(tk.Tk):
                 )
                 self.downloading_ids.discard(vid)
                 return
-            except (requests.RequestException, OSError) as exc:
+            except (requests.RequestException, OSError, TikTokAPIError, FacebookAPIError) as exc:
                 self.logs[vid] = f"Lỗi khi tải lúc {time.strftime('%H:%M:%S')}: {exc}"
                 self.task_queue.put(("video_status", (vid, "Lỗi")))
                 with lock:

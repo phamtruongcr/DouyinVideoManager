@@ -798,6 +798,73 @@ def _normalize_text_layers(text_overlay) -> list[dict]:
     return [layer for layer in text_overlay if layer]
 
 
+# ---------------------------------------------------------------------------
+# Lớp BLUR (làm mờ 1 vùng hình chữ nhật, không có chữ)
+# ---------------------------------------------------------------------------
+
+# Độ mờ (sigma của gaussian) = BLUR_SIGMA_PER_STRENGTH * strength% * chiều cao
+# khung. Tính theo TỈ LỆ chiều cao nên vùng mờ trông như nhau ở mọi độ phân
+# giải; khung xem trước trong trình chỉnh sửa dùng CHUNG hệ số này.
+BLUR_SIGMA_PER_STRENGTH = 0.0004   # strength 100 -> sigma = 4% chiều cao khung
+
+
+def is_blur_layer(layer: dict) -> bool:
+    return str(layer.get("kind", "text")) == "blur"
+
+
+def order_overlay_layers(layers: list[dict]) -> list[dict]:
+    """Thứ tự áp dụng khi xuất: mọi lớp blur trước, rồi tới lớp chữ (giữ
+    nguyên thứ tự tương đối trong mỗi nhóm)."""
+    return [x for x in layers if is_blur_layer(x)] + [x for x in layers if not is_blur_layer(x)]
+
+
+def blur_sigma(strength: float, frame_height: float) -> float:
+    """Sigma (pixel) của gaussian blur ứng với độ mờ `strength` (1..100) trên
+    khung hình cao `frame_height` pixel."""
+    return max(1.0, float(frame_height) * _clamp(float(strength), 1.0, 100.0) * BLUR_SIGMA_PER_STRENGTH)
+
+
+def blur_region_px(layer: dict, out_width: int, out_height: int) -> tuple[int, int, int, int]:
+    """(x, y, w, h) PIXEL của vùng blur trong khung `out_width` x `out_height`.
+    Lưu dạng tỉ lệ 0..1 (tâm cx, cy; kích thước bw, bh) nên khớp mọi độ phân
+    giải. Toàn bộ giá trị được làm CHẴN và kẹp trong khung (yuv420 cần tọa độ
+    chẵn để vùng mờ khớp khít, không lệch 1 pixel)."""
+    out_w, out_h = max(int(out_width), 4), max(int(out_height), 4)
+    bw = _clamp(float(layer.get("bw", 0.5)), 0.02, 1.0)
+    bh = _clamp(float(layer.get("bh", 0.12)), 0.02, 1.0)
+    cx = _clamp(float(layer.get("cx", 0.5)), 0.0, 1.0)
+    cy = _clamp(float(layer.get("cy", 0.85)), 0.0, 1.0)
+    max_w, max_h = out_w // 2 * 2, out_h // 2 * 2
+    w = min(max_w, max(4, round(bw * out_w) // 2 * 2))
+    h = min(max_h, max(4, round(bh * out_h) // 2 * 2))
+    x = int(_clamp(round(cx * out_w - w / 2), 0, out_w - w)) // 2 * 2
+    y = int(_clamp(round(cy * out_h - h / 2), 0, out_h - h)) // 2 * 2
+    return x, y, w, h
+
+
+def build_blur_filters(
+    layer: dict, in_label: str, out_label: str, index: int, out_width: int, out_height: int
+) -> list[str]:
+    """Các đoạn filter_complex làm mờ 1 vùng: tách luồng làm 2, cắt vùng ở
+    bản thứ nhất, làm mờ (gblur), rồi dán lại đúng chỗ cũ trên bản gốc. Chỉ
+    đụng tới vùng đã chọn; hiện trong khoảng thời gian [start, start+duration]
+    của lớp (duration 0 = đến hết video), cùng quy ước với chữ."""
+    x, y, w, h = blur_region_px(layer, out_width, out_height)
+    sigma = blur_sigma(layer.get("blur", 60), out_height)
+    base, src, blurred = f"[bb{index}]", f"[bs{index}]", f"[bl{index}]"
+    start = max(0.0, float(layer.get("start", 0) or 0))
+    duration = max(0.0, float(layer.get("duration", 0) or 0))
+    enable = ""
+    if start > 0 or duration > 0:
+        end_expr = f"{start + duration:g}" if duration > 0 else "1e9"
+        enable = f":enable='between(t,{start:g},{end_expr})'"
+    return [
+        f"{in_label}split=2{base}{src}",
+        f"{src}crop={w}:{h}:{x}:{y},gblur=sigma={sigma:.2f}:steps=3{blurred}",
+        f"{base}{blurred}overlay={x}:{y}{enable}{out_label}",
+    ]
+
+
 _filter_option_cache: dict[tuple[str, str, str], bool] = {}
 _option_type_cache: dict[tuple[str, str, str], str] = {}
 
@@ -895,8 +962,6 @@ def build_ffmpeg_command(
     loop_audio: bool = False,
     normalize_loudness: bool = False,
     fade_seconds: float = 0.0,
-    watermark_path: Optional[Path] = None,
-    watermark_opacity: int = 100,
     text_overlay=None,
     no_upscale: bool = False,
     trim_start: float = 0.0,
@@ -924,8 +989,11 @@ def build_ffmpeg_command(
 
     `target_short_side`: độ phân giải theo CẠNH NGẮN (720, 1080, 1440 = 2K,
     2160 = 4K) — xem `compute_output_size`.
-    `text_overlay`: 1 dict hoặc 1 DANH SÁCH dict (nhiều lớp chữ), xem
-    `build_drawtext_filter`.
+    `text_overlay`: 1 dict hoặc 1 DANH SÁCH dict (nhiều lớp). Mỗi lớp là
+    CHỮ (`kind` = "text", xem `build_drawtext_filter`) hoặc VÙNG BLUR không
+    chữ (`kind` = "blur", xem `build_blur_filters`). Mọi lớp blur luôn được
+    áp TRƯỚC, rồi mới vẽ chữ lên trên — để chữ mới đè lên vùng đã làm mờ
+    (VD: che phụ đề cũ rồi viết phụ đề mới) mà không bị mờ theo.
 
     `bg_music_path`: 1 file nhạc nền được TRỘN THÊM (không thay thế) vào
     audio chính (audio gốc video + audio ghép, theo đúng tỉ lệ đã trộn ở
@@ -953,7 +1021,7 @@ def build_ffmpeg_command(
     out_size = compute_output_size(
         aspect_ratio, target_short_side, video_info.width, video_info.height, no_upscale
     )
-    needs_video_filter = bool(out_size) or bool(watermark_path) or bool(layers)
+    needs_video_filter = bool(out_size) or bool(layers)
     needs_audio_filter = (
         (audio_mix_percent > 0 and video_info.has_audio)
         or normalize_loudness
@@ -981,11 +1049,6 @@ def build_ffmpeg_command(
     cmd += ["-i", str(audio_path)]
 
     next_input_idx = 2
-    watermark_input_idx = None
-    if watermark_path:
-        cmd += ["-i", str(watermark_path)]
-        watermark_input_idx = next_input_idx
-        next_input_idx += 1
 
     bg_music_input_idx = None
     if bg_music_path:
@@ -1012,27 +1075,22 @@ def build_ffmpeg_command(
                 filter_complex_parts.append(f"{cur}scale={ow}:{oh}[vfit]")
             cur = "[vfit]"
 
-        if watermark_path:
-            opacity = max(0, min(100, watermark_opacity)) / 100
-            filter_complex_parts.append(
-                f"[{watermark_input_idx}:v]format=rgba,colorchannelmixer=aa={opacity}[wm]"
-            )
-            wm_out = "[vwm]" if layers else "[vout]"
-            filter_complex_parts.append(f"{cur}[wm]overlay=W-w-16:H-h-16:format=auto{wm_out}")
-            cur = wm_out
-
         if layers:
-            # Các lớp chữ được vẽ SAU CÙNG (nằm trên watermark), lớp sau đè
-            # lên lớp trước — giống thứ tự lớp trong CapCut.
+            # Blur áp trước, chữ vẽ sau cùng (nằm trên blur); trong mỗi nhóm,
+            # lớp sau đè lên lớp trước — giống thứ tự lớp trong CapCut.
             out_w, out_h = out_size if out_size else (video_info.width, video_info.height)
-            for i, layer in enumerate(layers):
-                label = "[vout]" if i == len(layers) - 1 else f"[vt{i}]"
-                overlay = prepare_text_overlay(layer, out_w, out_h)
-                filter_complex_parts.append(
-                    f"{cur}{build_drawtext_filter(overlay, out_w, out_h)}{label}"
-                )
+            ordered = order_overlay_layers(layers)
+            for i, layer in enumerate(ordered):
+                label = "[vout]" if i == len(ordered) - 1 else f"[vt{i}]"
+                if is_blur_layer(layer):
+                    filter_complex_parts += build_blur_filters(layer, cur, label, i, out_w, out_h)
+                else:
+                    overlay = prepare_text_overlay(layer, out_w, out_h)
+                    filter_complex_parts.append(
+                        f"{cur}{build_drawtext_filter(overlay, out_w, out_h)}{label}"
+                    )
                 cur = label
-        elif not watermark_path:
+        else:
             # đổi tên label cuối thành [vout] cho thống nhất
             last = filter_complex_parts[-1]
             filter_complex_parts[-1] = last[: last.rfind("[")] + "[vout]"
