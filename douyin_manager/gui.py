@@ -2,7 +2,7 @@
 gui.py
 ======
 Cửa sổ chính của ứng dụng (class DouyinApp), gồm 2 TAB:
-  1. "Tải video Douyin": nạp danh sách video (kênh Douyin/TikTok/Facebook HOẶC
+  1. "Tải video": nạp danh sách video (kênh Douyin/TikTok/Facebook HOẶC
      dán link video đơn lẻ — 1 hay nhiều link), chọn/bỏ chọn, dịch tiêu đề,
      xóa khỏi danh sách, xuất TXT/Excel, tải video (đơn lẻ / hàng loạt).
      Bố cục từ trên xuống: Nguồn dữ liệu -> Cài đặt -> Hành động + Bảng -> Tiến độ.
@@ -44,6 +44,10 @@ from .config import (
     TRANSLATE_STYLE_OPTIONS,
     TRANSLATE_STYLE_CUSTOM,
     DEFAULT_CUSTOM_TITLE_PROMPT,
+    FETCH_ORDER_OPTIONS,
+    FETCH_ORDER_NEWEST,
+    DEFAULT_FETCH_ORDER,
+    DEFAULT_FETCH_MAX_ITEMS,
 )
 from .audio_merge_gui import AudioMergeTab
 from .douyin_client import DouyinAPIError, DouyinClient, DownloadCancelled
@@ -59,7 +63,11 @@ from .utils import (
     detect_platform,
     format_post_time, safe_filename, unique_filename,
 )
-from .widgets import AccentButton, WrapFrame, SegmentedTabs
+from .fetch_filters import FetchFilters, ItemCollector, parse_count_text, parse_date_text
+from .widgets import (
+    AccentButton, WrapFrame, SegmentedTabs, PlaceholderEntry, CalendarPopup,
+    make_card, bind_wraplength,
+)
 from . import theme
 
 CHECK_ON = "\u2611"   # ☑
@@ -159,7 +167,16 @@ class DouyinApp(tk.Tk):
         self.task_queue = queue.Queue()
         self.stop_loading_flag = False
         self.is_busy = False
+        self.is_loading = False   # đang lấy danh sách (nút chuyển thành "Dừng")
         self.is_translating = False
+
+        # Điều kiện lấy danh sách (nhớ giữa các lần mở app; ngày thì không nhớ)
+        self.fetch_order_label = next(
+            (lbl for lbl, val in FETCH_ORDER_OPTIONS.items()
+             if val == self.cfg.get("fetch_order", DEFAULT_FETCH_ORDER)),
+            next(iter(FETCH_ORDER_OPTIONS)),
+        )
+        self._date_target = "from"   # ô ngày mà nút lịch 📅 sẽ điền vào (ô được bấm gần nhất)
 
         # Cờ dừng tải dùng CHUNG cho mọi phiên tải (tải hàng loạt lẫn tải
         # từng video lẻ) — set() là báo hiệu dừng NGAY, kể cả video đang
@@ -172,6 +189,7 @@ class DouyinApp(tk.Tk):
         self.active_download_sessions = 0
 
         self._build_ui()
+        self._fit_window_height()
         self.after(100, self._poll_queue)
         self.after(150, self._reposition_action_buttons)
 
@@ -187,6 +205,17 @@ class DouyinApp(tk.Tk):
         y = max(0, (sh - h) // 2 - 20)
         self.geometry(f"{w}x{h}+{x}+{y}")
         self.minsize(min(900, sw), min(600, sh))
+
+    def _fit_window_height(self):
+        """Cao đủ để bảng video hiện trọn 10 dòng (nếu màn hình đủ cao)."""
+        self.update_idletasks()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = self.winfo_width() if self.winfo_width() > 1 else min(1280, max(900, sw - 100))
+        h = max(self.winfo_reqheight() + 8, 600)
+        h = min(h, sh - 90)
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2 - 20)
+        self.geometry(f"{w}x{h}+{x}+{y}")
 
     def _on_close(self):
         """Đóng app: dừng ghép đang chạy (nếu có) và xóa các bản xem thử tạm."""
@@ -210,7 +239,7 @@ class DouyinApp(tk.Tk):
 
         self.tab_download = ttk.Frame(self.notebook)
         self.merge_tab = AudioMergeTab(self.notebook, self.cfg)
-        self.notebook.add(self.tab_download, text="⬇  Tải video Douyin")
+        self.notebook.add(self.tab_download, text="⬇  Tải video")
         self.notebook.add(self.merge_tab, text="♫  Ghép Audio vào Video")
 
         self._build_download_tab(self.tab_download)
@@ -240,7 +269,7 @@ class DouyinApp(tk.Tk):
         # =================================================================
         # 1. NGUỒN DỮ LIỆU: link + số lượng + (Lấy danh sách | Cài đặt)
         # =================================================================
-        source = ttk.LabelFrame(top, text=" 1 · Nguồn dữ liệu ", padding=8)
+        source = ttk.LabelFrame(top, text=" 1 - Nguồn dữ liệu & Điều kiện lấy ", padding=8)
         source.pack(fill="x")
         source.columnconfigure(0, weight=1)
 
@@ -251,9 +280,6 @@ class DouyinApp(tk.Tk):
                 "(dán nhiều link video: mỗi link 1 dòng/cách nhau; có thể dán cả đoạn text lộn xộn)"
             ),
         ).grid(row=0, column=0, sticky="w")
-        ttk.Label(source, text="Số lượng video muốn lấy").grid(
-            row=0, column=1, sticky="w", padx=(10, 0)
-        )
 
         # Ô nhập link trải dài; dấu ✕ (xóa link) nằm BÊN TRONG ô, góc phải.
         # Chừa chỗ bên phải cho ✕ để chữ không chạy đè lên nó.
@@ -266,7 +292,10 @@ class DouyinApp(tk.Tk):
         self.link_var = tk.StringVar()
         self.link_entry = ttk.Entry(source, textvariable=self.link_var, style=link_style)
         self.link_entry.grid(row=1, column=0, sticky="ew", pady=(2, 0))
-        self.link_entry.bind("<Return>", lambda e: self.on_load_click())
+        # Đang lấy danh sách thì Enter KHÔNG được kích hoạt nút (lúc đó nút là "Dừng")
+        self.link_entry.bind(
+            "<Return>", lambda e: None if self.is_loading else self.on_load_click()
+        )
 
         entry_bg = style.lookup("TEntry", "fieldbackground") or "white"
         self._clear_btn = tk.Label(
@@ -278,18 +307,82 @@ class DouyinApp(tk.Tk):
         self._clear_btn.bind("<Leave>", lambda e: self._clear_btn.config(fg="#8a8a8a"))
         self.link_var.trace_add("write", lambda *_: self._update_clear_button())
 
-        self.max_items_var = tk.StringVar(value="")
-        ttk.Entry(source, textvariable=self.max_items_var, width=10).grid(
-            row=1, column=1, sticky="w", padx=(10, 0), pady=(2, 0)
+        # ---- Điều kiện lấy (áp dụng khi lấy danh sách video của 1 KÊNH) ----
+        # Thanh tiêu đề bấm được để thu gọn / mở rộng khung điều kiện
+        cond_head = ttk.Frame(source)
+        cond_head.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self._cond_chevron = ttk.Label(cond_head, text="▾", cursor="hand2")
+        self._cond_chevron.pack(side="left")
+        self._cond_title = ttk.Label(cond_head, text="Điều kiện lấy", cursor="hand2")
+        self._cond_title.pack(side="left", padx=(6, 0))
+        self._cond_summary_var = tk.StringVar()
+        self._cond_summary = ttk.Label(
+            cond_head, textvariable=self._cond_summary_var, style="Muted.TLabel", cursor="hand2"
         )
-        ttk.Label(
-            source,
-            text="Số lượng (chỉ áp dụng cho link kênh): để trống = lấy tất cả, tính từ video MỚI NHẤT trở về.",
-            style="Muted.TLabel",
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        for w in (cond_head, self._cond_chevron, self._cond_title, self._cond_summary):
+            w.bind("<Button-1>", lambda e: self._toggle_conditions())
+
+        cond = ttk.Frame(source)
+        cond.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        self._cond_frame = cond
+        self._cond_collapsed = False
+        for col, (weight, minw) in enumerate(((5, 330), (3, 190), (4, 290), (3, 150))):
+            cond.columnconfigure(col, weight=weight, minsize=minw)
+
+        def cond_card(col: int, title: str) -> ttk.Frame:
+            outer, box = make_card(cond, padding=(10, 6))
+            outer.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 8, 0))
+            ttk.Label(box, text=title).pack(anchor="w")
+            row = ttk.Frame(box)
+            row.pack(fill="x", pady=(4, 0))
+            return row
+
+        # Thẻ 1: Thời gian (từ ngày - đến ngày + lịch)
+        row = cond_card(0, "Thời gian:")
+        ttk.Label(row, text="Từ ngày").pack(side="left")
+        self.date_from_entry = PlaceholderEntry(row, "[ DD/MM/YYYY ]", width=14)
+        self.date_from_entry.pack(side="left", padx=(6, 8))
+        ttk.Label(row, text="đến").pack(side="left")
+        self.date_to_entry = PlaceholderEntry(row, "[ DD/MM/YYYY ]", width=14)
+        self.date_to_entry.pack(side="left", padx=(6, 6))
+        self.date_from_entry.bind(
+            "<FocusIn>", lambda e: setattr(self, "_date_target", "from"), add="+"
+        )
+        self.date_to_entry.bind(
+            "<FocusIn>", lambda e: setattr(self, "_date_target", "to"), add="+"
+        )
+        cal_btn = tk.Label(row, text="📅", bg=theme.CARD, fg=theme.MUTED, cursor="hand2")
+        cal_btn.pack(side="left")
+        cal_btn.bind("<Button-1>", lambda e: self._open_calendar())
+        cal_btn.bind("<Enter>", lambda e: cal_btn.configure(fg=theme.FG))
+        cal_btn.bind("<Leave>", lambda e: cal_btn.configure(fg=theme.MUTED))
+        Tooltip(cal_btn, "Chọn ngày bằng lịch (điền vào ô ngày đang chọn)")
+
+        # Thẻ 2: Thứ tự
+        row = cond_card(1, "Thứ tự:")
+        self.fetch_order_var = tk.StringVar(value=self.fetch_order_label)
+        ttk.Combobox(
+            row, textvariable=self.fetch_order_var, state="readonly",
+            values=list(FETCH_ORDER_OPTIONS.keys()), width=19,
+        ).pack(side="left", fill="x", expand=True)
+
+        # Thẻ 3: Lượt xem & lượt tym tối thiểu
+        row = cond_card(2, "Lượt tương tác & tym")
+        self.min_views_var = tk.StringVar(value=str(self.cfg.get("fetch_min_views", 0) or 0))
+        self.min_likes_var = tk.StringVar(value=str(self.cfg.get("fetch_min_likes", 0) or 0))
+        ttk.Label(row, text="👁 view >=").pack(side="left")
+        ttk.Entry(row, textvariable=self.min_views_var, width=9).pack(side="left", padx=(6, 12))
+        ttk.Label(row, text="♥ Lượt tym >=").pack(side="left")
+        ttk.Entry(row, textvariable=self.min_likes_var, width=9).pack(side="left", padx=(6, 0))
+
+        # Thẻ 4: Tối đa số video
+        row = cond_card(3, "Tối đa số video:")
+        max_default = self.cfg.get("fetch_max_items", DEFAULT_FETCH_MAX_ITEMS)
+        self.max_items_var = tk.StringVar(value=str(max_default) if max_default else "")
+        ttk.Entry(row, textvariable=self.max_items_var, width=10).pack(side="left", fill="x", expand=True)
 
         source_btns = ttk.Frame(source)
-        source_btns.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        source_btns.grid(row=4, column=0, sticky="w", pady=(8, 0))
         self.load_btn = AccentButton(
             source_btns, text="🔍 Lấy danh sách video", command=self.on_load_click,
             bg="#1a73e8", hover_bg="#1557b0", padx=18, pady=6,
@@ -298,6 +391,8 @@ class DouyinApp(tk.Tk):
         ttk.Button(
             source_btns, text="⚙ Cài đặt (Cookie)", command=self.open_settings
         ).pack(side="left", padx=(8, 0))
+        if self.cfg.get("fetch_cond_collapsed", False):
+            self._toggle_conditions(save=False)
 
         # =================================================================
         # 2. CÀI ĐẶT: tách riêng "Tải về" và "Xử lý / Dịch thuật"
@@ -316,7 +411,7 @@ class DouyinApp(tk.Tk):
             return sp
 
         # ---- 2a. Cài đặt TẢI VỀ ----
-        dl = ttk.LabelFrame(settings, text=" 2a · Cài đặt tải về ", padding=8)
+        dl = ttk.LabelFrame(settings, text=" 2a - Cài đặt tải về ", padding=8)
         dl.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         dl.columnconfigure(1, weight=1)
 
@@ -346,7 +441,7 @@ class DouyinApp(tk.Tk):
         ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=2)
 
         # ---- 2b. Cài đặt XỬ LÝ / DỊCH THUẬT ----
-        tr = ttk.LabelFrame(settings, text=" 2b · Xử lý / Dịch thuật ", padding=8)
+        tr = ttk.LabelFrame(settings, text=" 2b - Xử lý / Dịch thuật ", padding=8)
         tr.grid(row=0, column=1, sticky="nsew")
         tr.columnconfigure(1, weight=1)
 
@@ -354,7 +449,7 @@ class DouyinApp(tk.Tk):
             value=bool(self.cfg.get("auto_translate_titles", False))
         )
         ttk.Checkbutton(
-            tr, text="Dịch tiêu đề → Tiếng Việt (tự động sau khi lấy danh sách)",
+            tr, text="Dịch tiêu đề (tự động sau khi lấy danh sách)",
             variable=self.auto_translate_var, command=self._on_auto_translate_toggled,
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=2)
 
@@ -448,7 +543,7 @@ class DouyinApp(tk.Tk):
         # Dịch thủ công (video đã tick, hoặc tất cả nếu chưa tick) — dùng khi
         # tắt dịch tự động ở 2b, hoặc muốn dịch lại sau khi đổi kiểu dịch.
         toolbar.add(ttk.Button(
-            toolbar, text="🌐 Dịch tiêu đề → Tiếng Việt", command=self.on_translate_titles
+            toolbar, text="🌐 Dịch tiêu đề", command=self.on_translate_titles
         ))
 
         table_row = ttk.Frame(mid)
@@ -468,7 +563,7 @@ class DouyinApp(tk.Tk):
             "stt",  # số thứ tự: nằm cuối ở dữ liệu nhưng hiển thị ngay sau checkbox
         )
         self.tree = ttk.Treeview(
-            table_row, columns=cols, show="headings", selectmode="extended",
+            table_row, columns=cols, show="headings", selectmode="extended", height=10,
             displaycolumns=(
                 "chk", "stt", "title", "url", "duration", "post_time",
                 "status", "download", "log", "edit", "delete",
@@ -1052,7 +1147,117 @@ class DouyinApp(tk.Tk):
         save_config(self.cfg)
 
     # ------------------------------------------------------ Nạp danh sách --
+    def _cond_summary_text(self) -> str:
+        """Tóm tắt điều kiện hiện tại (đọc thô từ các ô, không báo lỗi) khi khung thu gọn."""
+        parts = []
+        d1, d2 = self.date_from_entry.value(), self.date_to_entry.value()
+        if d1 or d2:
+            parts.append(f"{d1 or '...'} → {d2 or '...'}")
+        parts.append(self.fetch_order_var.get())
+        for label, var in (("view", self.min_views_var), ("tym", self.min_likes_var)):
+            v = var.get().strip()
+            if v and v != "0":
+                parts.append(f"{label} ≥ {v}")
+        mx = self.max_items_var.get().strip()
+        parts.append(f"tối đa {mx}" if mx and mx != "0" else "không giới hạn số lượng")
+        return " · ".join(parts)
+
+    def _toggle_conditions(self, save: bool = True):
+        """Thu gọn / mở rộng khung điều kiện (trạng thái được nhớ cho lần mở sau)."""
+        self._cond_collapsed = not self._cond_collapsed
+        if self._cond_collapsed:
+            self._cond_frame.grid_remove()
+            self._cond_chevron.configure(text="▸")
+            self._cond_summary_var.set(self._cond_summary_text())
+            self._cond_summary.pack(side="left", padx=(12, 0))
+        else:
+            self._cond_frame.grid()
+            self._cond_chevron.configure(text="▾")
+            self._cond_summary.pack_forget()
+        if save:
+            self.cfg["fetch_cond_collapsed"] = self._cond_collapsed
+            save_config(self.cfg)
+
+    def _open_calendar(self):
+        """Mở lịch chọn ngày; điền vào ô 'Từ ngày' hoặc 'Đến ngày' (ô được bấm gần nhất)."""
+        if self._date_target == "to":
+            entry, title = self.date_to_entry, "Chọn ngày kết thúc (Đến ngày)"
+        else:
+            entry, title = self.date_from_entry, "Chọn ngày bắt đầu (Từ ngày)"
+        try:
+            initial = parse_date_text(entry.value())
+        except ValueError:
+            initial = None
+        CalendarPopup(
+            self, entry, title, initial,
+            lambda d, e=entry: e.set_value(d.strftime("%d/%m/%Y") if d else ""),
+        )
+
+    def _read_fetch_filters(self) -> FetchFilters | None:
+        """Đọc + kiểm tra các ô điều kiện. Sai thì báo lỗi, đưa con trỏ về ô sai
+        và trả None (không bắt đầu lấy danh sách)."""
+
+        def bad(msg: str, widget):
+            messagebox.showwarning(APP_TITLE, msg)
+            widget.focus_set()
+            return None
+
+        try:
+            date_from = parse_date_text(self.date_from_entry.value())
+        except ValueError as exc:
+            return bad(f"Ô \"Từ ngày\": {exc}", self.date_from_entry)
+        try:
+            date_to = parse_date_text(self.date_to_entry.value())
+        except ValueError as exc:
+            return bad(f"Ô \"Đến ngày\": {exc}", self.date_to_entry)
+        if date_from and date_to and date_from > date_to:
+            return bad("\"Từ ngày\" phải trước hoặc bằng \"Đến ngày\".", self.date_from_entry)
+
+        try:
+            min_views = parse_count_text(self.min_views_var.get())
+        except ValueError as exc:
+            return bad(f"Ô \"view >=\": {exc}", self.date_from_entry)
+        try:
+            min_likes = parse_count_text(self.min_likes_var.get())
+        except ValueError as exc:
+            return bad(f"Ô \"Lượt tym >=\": {exc}", self.date_from_entry)
+        try:
+            max_items = parse_count_text(self.max_items_var.get())
+        except ValueError:
+            return bad(
+                "\"Tối đa số video\" phải là một số nguyên dương (hoặc để trống = không giới hạn).",
+                self.date_from_entry,
+            )
+
+        order = FETCH_ORDER_OPTIONS.get(self.fetch_order_var.get(), DEFAULT_FETCH_ORDER)
+        # Nhớ lại các điều kiện (trừ ngày) cho lần mở app sau
+        self.cfg.update({
+            "fetch_order": order,
+            "fetch_min_views": min_views,
+            "fetch_min_likes": min_likes,
+            "fetch_max_items": max_items,
+        })
+        save_config(self.cfg)
+        return FetchFilters(
+            date_from=date_from, date_to=date_to,
+            newest_first=(order == FETCH_ORDER_NEWEST),
+            min_views=min_views, min_likes=min_likes, max_items=max_items,
+        )
+
+    def _set_loading(self, loading: bool):
+        """Nút xanh 'Lấy danh sách' <-> nút đỏ 'Dừng lấy' trong lúc đang quét."""
+        self.is_loading = loading
+        if loading:
+            self.load_btn.set_look("⏹ Dừng lấy danh sách", bg="#d93025", hover_bg="#a52714")
+        else:
+            self.load_btn.set_look("🔍 Lấy danh sách video", bg="#1a73e8", hover_bg="#1557b0")
+
     def on_load_click(self):
+        if self.is_loading:
+            # Đang quét: bấm lần nữa = dừng, vẫn giữ những video đã lấy được
+            self.stop_loading_flag = True
+            self.status_var.set("Đang dừng... (giữ lại các video đã lấy được)")
+            return
         if self.is_busy:
             return
         raw = self.link_var.get().strip()
@@ -1063,19 +1268,12 @@ class DouyinApp(tk.Tk):
                 "Không tìm thấy link Douyin, TikTok hoặc Facebook hợp lệ trong nội dung đã nhập.",
             )
             return
+        filters = self._read_fetch_filters()
+        if filters is None:
+            return
         # cập nhật lại ô nhập bằng link đã làm sạch (nhiều link -> cách nhau bằng dấu cách)
         clean = links[0]
         self.link_var.set("  ".join(links))
-
-        qty_raw = self.max_items_var.get().strip()
-        max_items = 0
-        if qty_raw:
-            if not qty_raw.isdigit() or int(qty_raw) <= 0:
-                messagebox.showwarning(
-                    APP_TITLE, "Số lượng video phải là một số nguyên dương (hoặc để trống)."
-                )
-                return
-            max_items = int(qty_raw)
 
         for vid in list(self.row_widgets.keys()):
             self._destroy_row_widgets(vid)
@@ -1089,18 +1287,60 @@ class DouyinApp(tk.Tk):
 
         self.is_busy = True
         self.stop_loading_flag = False
-        self.status_var.set(f"Đang phân giải link: {clean}")
+        self._set_loading(True)
         self.download_btn.state(["disabled"])
 
         if len(links) > 1:
-            # Nhiều link dán cùng lúc -> coi là danh sách video đơn lẻ
+            # Nhiều link dán cùng lúc -> coi là danh sách video đơn lẻ (không lọc)
+            self.status_var.set(f"Đang đọc {len(links)} link video...")
             threading.Thread(
-                target=self._load_single_worker, args=(links,), daemon=True
+                target=self._load_thread_main, args=(self._load_single_worker, links), daemon=True
             ).start()
         else:
+            self.status_var.set(f"Đang phân giải link: {clean}  |  Điều kiện: {filters.describe()}")
             threading.Thread(
-                target=self._load_worker, args=(clean, max_items), daemon=True
+                target=self._load_thread_main, args=(self._load_worker, clean, filters),
+                daemon=True,
             ).start()
+
+    def _load_thread_main(self, fn, *args):
+        """Chạy worker lấy danh sách; lỗi bất ngờ cũng phải trả lại trạng thái bình
+        thường cho nút (không để kẹt ở chế độ 'Dừng')."""
+        try:
+            fn(*args)
+        except Exception as exc:  # noqa: BLE001
+            self.task_queue.put(("error", f"Lỗi không mong đợi khi lấy danh sách: {exc}"))
+            self.task_queue.put(("load_done", None))
+
+    def _make_collector(self, filters: FetchFilters, client=None) -> ItemCollector:
+        """Bộ thu thập áp điều kiện. `client` (TikTok/Facebook) dùng để bổ sung
+        ngày/view/tym cho video mà danh sách kênh không kèm số liệu đó."""
+
+        def progress(scanned: int, matched: int):
+            self.task_queue.put(
+                ("status", f"Đang quét kênh... đã quét {scanned} video · khớp điều kiện {matched}")
+            )
+
+        enrich = client.fetch_video_info if (client is not None and filters.is_active) else None
+        return ItemCollector(
+            filters, stop_flag=lambda: self.stop_loading_flag, enrich=enrich,
+            progress_cb=progress,
+        )
+
+    def _post_fetch_summary(self, collector: ItemCollector, warning: str = ""):
+        """Báo kết quả quét (đã quét bao nhiêu, vì sao video bị loại) ở thanh trạng thái."""
+        if self.stop_loading_flag:
+            collector.stopped_by_user = True
+        if not collector.scanned:
+            if collector.stopped_by_user:
+                self.task_queue.put(("status", "Đã dừng lấy danh sách."))
+            elif warning:
+                self.task_queue.put(("status", "⚠ " + warning))
+            return
+        msg = collector.summary()
+        if warning:
+            msg += "  ⚠ " + warning
+        self.task_queue.put(("status", msg))
 
     def _auto_refresh_cookies(self, platform: str):
         """Nếu bật "Tự lấy lại Cookie": đọc cookie mới từ trình duyệt đã chọn
@@ -1193,14 +1433,14 @@ class DouyinApp(tk.Tk):
             )
         self.task_queue.put(("load_done", None))
 
-    def _load_worker(self, link: str, max_items: int = 0):
+    def _load_worker(self, link: str, filters: FetchFilters):
         platform = detect_platform(link) or "douyin"
         self._auto_refresh_cookies(platform)
         if platform == "tiktok":
-            self._load_worker_tiktok(link, max_items)
+            self._load_worker_tiktok(link, filters)
             return
         if platform == "facebook":
-            self._load_worker_facebook(link, max_items)
+            self._load_worker_facebook(link, filters)
             return
         try:
             kind, ident = resolve_link(link)
@@ -1216,16 +1456,13 @@ class DouyinApp(tk.Tk):
 
         sec_uid = ident
         self.task_queue.put(("status", f"Đang tải danh sách video (sec_uid: {sec_uid[:12]}...)"))
-
-        def progress_cb(count):
-            self.task_queue.put(("status", f"Đã tải {count} video..."))
-
+        # Danh sách kênh Douyin đã kèm đủ ngày/tym nên không cần enrich từng video
+        collector = self._make_collector(filters)
         try:
             items = self.client.fetch_all_user_posts(
                 sec_uid,
                 stop_flag=lambda: self.stop_loading_flag,
-                progress_cb=progress_cb,
-                max_items=max_items,
+                collector=collector,
             )
         except DouyinAPIError as exc:
             self.task_queue.put(("error", str(exc)))
@@ -1233,9 +1470,10 @@ class DouyinApp(tk.Tk):
             return
 
         self.task_queue.put(("videos_loaded", items))
+        self._post_fetch_summary(collector)
         self.task_queue.put(("load_done", None))
 
-    def _load_worker_tiktok(self, link: str, max_items: int = 0):
+    def _load_worker_tiktok(self, link: str, filters: FetchFilters):
         """Lấy danh sách video của 1 kênh TikTok (qua yt-dlp), đẩy kết quả vào
         queue đúng như luồng Douyin để phần hiển thị/tải dùng chung."""
         try:
@@ -1251,16 +1489,12 @@ class DouyinApp(tk.Tk):
 
         profile_url = ident
         self.task_queue.put(("status", f"Đang lấy danh sách video TikTok: {profile_url}"))
-
-        def progress_cb(count):
-            self.task_queue.put(("status", f"Đã lấy {count} video TikTok..."))
-
+        collector = self._make_collector(filters, self.tiktok_client)
         try:
             items = self.tiktok_client.fetch_all_user_posts(
                 profile_url,
                 stop_flag=lambda: self.stop_loading_flag,
-                progress_cb=progress_cb,
-                max_items=max_items,
+                collector=collector,
             )
         except TikTokAPIError as exc:
             self.task_queue.put(("error", str(exc)))
@@ -1268,11 +1502,10 @@ class DouyinApp(tk.Tk):
             return
 
         self.task_queue.put(("videos_loaded", items))
-        if self.tiktok_client.last_warning:
-            self.task_queue.put(("status", "⚠ " + self.tiktok_client.last_warning))
+        self._post_fetch_summary(collector, self.tiktok_client.last_warning)
         self.task_queue.put(("load_done", None))
 
-    def _load_worker_facebook(self, link: str, max_items: int = 0):
+    def _load_worker_facebook(self, link: str, filters: FetchFilters):
         """Link Facebook: video/reel đơn lẻ -> nạp 1 hàng; trang/kênh -> thử liệt
         kê video của trang (best-effort qua yt-dlp)."""
         try:
@@ -1287,16 +1520,12 @@ class DouyinApp(tk.Tk):
             return
 
         self.task_queue.put(("status", f"Đang lấy danh sách video Facebook: {ident}"))
-
-        def progress_cb(count):
-            self.task_queue.put(("status", f"Đã lấy {count} video Facebook..."))
-
+        collector = self._make_collector(filters, self.facebook_client)
         try:
             items = self.facebook_client.fetch_all_user_posts(
                 ident,
                 stop_flag=lambda: self.stop_loading_flag,
-                progress_cb=progress_cb,
-                max_items=max_items,
+                collector=collector,
             )
         except FacebookAPIError as exc:
             self.task_queue.put(("error", str(exc)))
@@ -1304,8 +1533,7 @@ class DouyinApp(tk.Tk):
             return
 
         self.task_queue.put(("videos_loaded", items))
-        if self.facebook_client.last_warning:
-            self.task_queue.put(("status", "⚠ " + self.facebook_client.last_warning))
+        self._post_fetch_summary(collector, self.facebook_client.last_warning)
         self.task_queue.put(("load_done", None))
 
     # --------------------------------------------------------- Poll queue --
@@ -1323,6 +1551,7 @@ class DouyinApp(tk.Tk):
                     self.set_all_checked(True)
                 elif kind == "load_done":
                     self.is_busy = False
+                    self._set_loading(False)
                     self.download_btn.state(["!disabled"])
                     # Công tắc "Dịch tiêu đề → Tiếng Việt" bật: tự dịch luôn
                     # toàn bộ danh sách vừa lấy (nếu lấy được video nào)

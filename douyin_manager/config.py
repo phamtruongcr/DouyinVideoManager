@@ -103,6 +103,17 @@ MIN_FILENAME_MAX_LEN = 10
 # và được báo trong cột Log, không làm hỏng các video khác.
 MAX_FILENAME_MAX_LEN = 120
 
+# --- Điều kiện khi LẤY DANH SÁCH video của kênh (xem fetch_filters.py) ---
+# Thứ tự kết quả: nhãn hiển thị trong ô chọn -> giá trị lưu vào config.
+FETCH_ORDER_NEWEST = "newest"
+FETCH_ORDER_OLDEST = "oldest"
+FETCH_ORDER_OPTIONS = {
+    "Mới nhất -> Cũ nhất": FETCH_ORDER_NEWEST,
+    "Cũ nhất -> Mới nhất": FETCH_ORDER_OLDEST,
+}
+DEFAULT_FETCH_ORDER = FETCH_ORDER_NEWEST
+DEFAULT_FETCH_MAX_ITEMS = 10   # số video tối đa mỗi lần lấy (để trống/0 = không giới hạn)
+
 # --- Cấu hình tính năng "Ghép Audio vào Video" (dùng ffmpeg) ---
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".flv", ".webm", ".m4v", ".ts"}
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".wma"}

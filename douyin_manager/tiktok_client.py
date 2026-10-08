@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .douyin_client import DownloadCancelled
+from .fetch_filters import FetchFilters, ItemCollector, _to_int_or_none
 
 
 class TikTokAPIError(Exception):
@@ -142,6 +143,8 @@ def _entry_to_item(entry: dict) -> Optional[dict]:
         "url": url,
         "create_time": create_time,
         "duration_s": duration_s,
+        "view_count": _to_int_or_none(entry.get("view_count")),
+        "like_count": _to_int_or_none(entry.get("like_count")),
         "platform": "tiktok",
     }
 
@@ -214,6 +217,7 @@ class TikTokClient:
         stop_flag: Callable[[], bool],
         progress_cb: Optional[Callable[[int], None]] = None,
         max_items: int = 0,
+        collector: Optional[ItemCollector] = None,
     ) -> list[dict]:
         """Lấy video của kênh `profile_url` (dạng https://www.tiktok.com/@user),
         MỚI NHẤT trước. `max_items` = 0 -> lấy hết. Lấy dần từng video và kiểm
@@ -222,7 +226,9 @@ class TikTokClient:
         self.last_warning = ""
         logger = _CollectLogger()
         cookie_path = self._make_cookie_file()
-        items: list[dict] = []
+        if collector is None:
+            collector = ItemCollector(FetchFilters(max_items=max_items), stop_flag=stop_flag)
+        items = collector.items   # dùng chung danh sách để biết đã lấy được bao nhiêu khi lỗi giữa chừng
         seen: set[str] = set()
         try:
             opts = self._base_opts(logger, cookie_path)
@@ -245,19 +251,19 @@ class TikTokClient:
                         if not item or item["id"] in seen:
                             continue
                         seen.add(item["id"])
-                        items.append(item)
+                        done = collector.feed(item)
                         if progress_cb:
                             progress_cb(len(items))
-                        if max_items and len(items) >= max_items:
+                        if done:
                             break
             except TikTokAPIError:
                 raise
             except Exception as exc:  # DownloadError/ExtractorError/lỗi mạng...
-                if not items:
+                if not collector.scanned:
                     raise TikTokAPIError(_friendly_error(exc)) from exc
                 # Đã lấy được 1 phần -> trả phần đó, ghi chú để GUI báo
                 self.last_warning = (
-                    f"Dừng sớm sau {len(items)} video do lỗi: {str(exc)[:200]}"
+                    f"Dừng sớm sau khi quét {collector.scanned} video do lỗi: {str(exc)[:200]}"
                 )
         finally:
             if cookie_path:
@@ -268,7 +274,7 @@ class TikTokClient:
 
         if not items and logger.warnings:
             self.last_warning = logger.warnings[-1][:300]
-        return items
+        return collector.result()
 
     # ----------------------------------------------------------- Tải về --
     def download_video(

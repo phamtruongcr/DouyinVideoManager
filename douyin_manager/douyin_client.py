@@ -21,6 +21,7 @@ from pathlib import Path
 import requests
 
 from .config import USER_AGENT, MOBILE_USER_AGENT, REQUEST_TIMEOUT, PAGE_COUNT, REQUEST_DELAY
+from .fetch_filters import FetchFilters, ItemCollector, _to_int_or_none
 
 
 class DouyinAPIError(Exception):
@@ -34,7 +35,8 @@ class DownloadCancelled(Exception):
 
 def _aweme_to_item(item: dict):
     """Đổi 1 object 'aweme' (video) của Douyin về item {id, desc, url,
-    create_time, duration_s}. None nếu thiếu dữ liệu/không có link phát."""
+    create_time, duration_s, view_count, like_count}. None nếu thiếu dữ liệu/không
+    có link phát. view_count/like_count = None nếu Douyin không trả số liệu."""
     try:
         aweme_id = item["aweme_id"]
         desc = (item.get("desc") or "").strip() or f"(không có mô tả) {aweme_id}"
@@ -49,12 +51,19 @@ def _aweme_to_item(item: dict):
         no_wm_url = raw_play_url.replace("playwm", "play")
         create_time = item.get("create_time", 0)
         duration_ms = video.get("duration", 0)
+        stats = item.get("statistics") or {}
+        # Douyin hay ẩn lượt xem (play_count = 0) -> coi là "không có số liệu"
+        # (None) thay vì 0 thật, để bộ lọc không loại nhầm và báo rõ cho người dùng.
+        view_count = _to_int_or_none(stats.get("play_count")) or None
+        like_count = _to_int_or_none(stats.get("digg_count"))
         return {
             "id": str(aweme_id),
             "desc": desc,
             "url": no_wm_url,
             "create_time": create_time,
             "duration_s": round(duration_ms / 1000) if duration_ms else 0,
+            "view_count": view_count,
+            "like_count": like_count,
         }
     except (KeyError, IndexError, TypeError, AttributeError):
         return None
@@ -215,25 +224,32 @@ class DouyinClient:
                 "trong mục Cài đặt (xem README.md)."
             ) from exc
 
-    def fetch_all_user_posts(self, sec_uid: str, stop_flag, progress_cb=None, max_items=0):
-        """Lặp lấy hết các trang. `stop_flag` là callable trả True nếu cần dừng.
-        `progress_cb(count)` được gọi sau mỗi trang để cập nhật UI."""
-        all_items = []
+    def fetch_all_user_posts(
+        self, sec_uid: str, stop_flag, progress_cb=None, max_items=0, collector=None,
+    ):
+        """Lặp lấy các trang (video MỚI NHẤT trước) cho tới khi đủ/hết.
+        `stop_flag` là callable trả True nếu cần dừng.
+        `progress_cb(count)` được gọi sau mỗi trang để cập nhật UI.
+        `collector` (ItemCollector) áp điều kiện ngày/view/tym/thứ tự/số lượng;
+        không truyền -> chỉ giới hạn bằng `max_items` như trước đây."""
+        if collector is None:
+            collector = ItemCollector(FetchFilters(max_items=max_items), stop_flag=stop_flag)
         cursor = 0
         while True:
             if stop_flag():
                 break
             items, has_more, cursor = self.fetch_user_posts_page(sec_uid, cursor)
-            all_items.extend(items)
+            done = False
+            for item in items:
+                if collector.feed(item):
+                    done = True
+                    break
             if progress_cb:
-                progress_cb(len(all_items))
-            if max_items and len(all_items) >= max_items:
-                all_items = all_items[:max_items]
-                break
-            if not has_more or not items:
+                progress_cb(len(collector.items))
+            if done or not has_more or not items:
                 break
             time.sleep(REQUEST_DELAY)
-        return all_items
+        return collector.result()
 
     def download_video(self, url: str, dest_path: Path, chunk_cb=None, stop_flag=None):
         """Tải video về `dest_path`.

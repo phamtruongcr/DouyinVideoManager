@@ -6,7 +6,9 @@ Các widget Tkinter tùy chỉnh dùng chung cho GUI.
 
 from __future__ import annotations
 
+import calendar
 import tkinter as tk
+from datetime import date
 from tkinter import ttk
 
 from . import theme
@@ -138,6 +140,16 @@ class AccentButton(tk.Label):
     def invoke(self):
         if not self._disabled and self._command is not None:
             self._command()
+
+    def set_look(self, text: str | None = None, bg: str | None = None,
+                 hover_bg: str | None = None):
+        """Đổi chữ / màu nút khi đang chạy (vd nút "Lấy danh sách" -> "Dừng")."""
+        if text is not None:
+            self.configure(text=text)
+        if bg is not None:
+            self._bg = bg
+            self._hover_bg = hover_bg or bg
+        self._paint()
 
 
 class ScrollableFrame(ttk.Frame):
@@ -405,3 +417,177 @@ class CollapsibleNote(ttk.Frame):
         else:
             self._body.pack_forget()
             self._toggle.configure(text=f"▸ {self._title}")
+
+
+# ============================================================================
+# Ô nhập có chữ gợi ý + lịch chọn ngày (dùng cho điều kiện "Thời gian")
+# ============================================================================
+
+class PlaceholderEntry(ttk.Entry):
+    """Ô nhập có chữ gợi ý mờ (vd "[ DD/MM/YYYY ]") khi đang trống và chưa focus.
+
+    Luôn đọc/ghi qua `value()` / `set_value()` (KHÔNG dùng .get() trực tiếp vì
+    lúc hiện gợi ý thì .get() trả về chính chữ gợi ý)."""
+
+    def __init__(self, master, placeholder: str, **kwargs):
+        super().__init__(master, **kwargs)
+        self._placeholder = placeholder
+        self._showing = False
+        self.bind("<FocusIn>", self._on_focus_in, add="+")
+        self.bind("<FocusOut>", self._on_focus_out, add="+")
+        self._show_placeholder()
+
+    def _show_placeholder(self):
+        if self._showing or super().get():
+            return
+        self._showing = True
+        self.insert(0, self._placeholder)
+        self.configure(foreground=theme.MUTED)
+
+    def _hide_placeholder(self):
+        if not self._showing:
+            return
+        self._showing = False
+        self.delete(0, "end")
+        self.configure(foreground=theme.FG)
+
+    def _on_focus_in(self, _event=None):
+        self._hide_placeholder()
+
+    def _on_focus_out(self, _event=None):
+        if not super().get():
+            self._show_placeholder()
+
+    def value(self) -> str:
+        return "" if self._showing else super().get().strip()
+
+    def set_value(self, text: str):
+        self._hide_placeholder()
+        self.delete(0, "end")
+        self.insert(0, text)
+        self.configure(foreground=theme.FG)
+        try:
+            has_focus = self.focus_get() is self
+        except (KeyError, tk.TclError):  # focus_get có thể lỗi khi popup combobox đang mở
+            has_focus = False
+        if not text and not has_focus:
+            self._show_placeholder()
+
+
+class CalendarPopup(tk.Toplevel):
+    """Lịch chọn ngày nhỏ gọn (thuần Tkinter, không cần thư viện ngoài).
+
+    `on_pick(date | None)` được gọi khi bấm 1 ngày ("Hôm nay" -> ngày hôm nay,
+    "Xóa" -> None); cửa sổ tự đóng sau khi chọn."""
+
+    _WEEKDAYS = ("T2", "T3", "T4", "T5", "T6", "T7", "CN")
+
+    def __init__(self, master, anchor: tk.Widget, title: str, initial: date | None, on_pick):
+        super().__init__(master)
+        self.withdraw()
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(master.winfo_toplevel())
+        self.configure(bg=theme.CARD_BORDER)
+        self._on_pick = on_pick
+        self._selected = initial
+        today = date.today()
+        base = initial or today
+        self._year, self._month = base.year, base.month
+        self._today = today
+
+        body = tk.Frame(self, bg=theme.CARD, padx=8, pady=8)
+        body.pack(padx=1, pady=1)
+
+        head = tk.Frame(body, bg=theme.CARD)
+        head.pack(fill="x")
+        self._nav(head, "«", lambda: self._shift(-12)).pack(side="left")
+        self._nav(head, "‹", lambda: self._shift(-1)).pack(side="left", padx=(2, 0))
+        self._nav(head, "»", lambda: self._shift(12)).pack(side="right")
+        self._nav(head, "›", lambda: self._shift(1)).pack(side="right", padx=(0, 2))
+        self._title_lbl = tk.Label(
+            head, bg=theme.CARD, fg=theme.FG, font=("", 10, "bold"), width=14
+        )
+        self._title_lbl.pack(side="left", expand=True)
+
+        self._grid = tk.Frame(body, bg=theme.CARD)
+        self._grid.pack(pady=(6, 4))
+
+        foot = tk.Frame(body, bg=theme.CARD)
+        foot.pack(fill="x")
+        self._link(foot, "Hôm nay", lambda: self._pick(today)).pack(side="left")
+        self._link(foot, "Xóa", lambda: self._pick(None)).pack(side="right")
+
+        self._render()
+        self.update_idletasks()
+        # đặt ngay dưới ô neo, không tràn ra ngoài màn hình
+        x = anchor.winfo_rootx()
+        y = anchor.winfo_rooty() + anchor.winfo_height() + 4
+        x = max(0, min(x, self.winfo_screenwidth() - self.winfo_reqwidth() - 4))
+        y = max(0, min(y, self.winfo_screenheight() - self.winfo_reqheight() - 4))
+        self.geometry(f"+{x}+{y}")
+        self.deiconify()
+        self.bind("<Escape>", lambda e: self.destroy())
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+        self.focus_set()
+
+    # ---- thành phần nhỏ ----
+    def _nav(self, parent, text, command):
+        lbl = tk.Label(
+            parent, text=text, bg=theme.BTN, fg=theme.FG, width=3, cursor="hand2",
+        )
+        lbl.bind("<Button-1>", lambda e: command())
+        lbl.bind("<Enter>", lambda e: lbl.configure(bg=theme.BTN_HOVER))
+        lbl.bind("<Leave>", lambda e: lbl.configure(bg=theme.BTN))
+        return lbl
+
+    def _link(self, parent, text, command):
+        lbl = tk.Label(parent, text=text, bg=theme.CARD, fg=theme.LINK, cursor="hand2")
+        lbl.bind("<Button-1>", lambda e: command())
+        return lbl
+
+    def _shift(self, months: int):
+        idx = self._year * 12 + (self._month - 1) + months
+        self._year, self._month = idx // 12, idx % 12 + 1
+        self._year = max(1970, min(2100, self._year))
+        self._render()
+
+    def _render(self):
+        self._title_lbl.configure(text=f"Tháng {self._month:02d} / {self._year}")
+        for w in self._grid.winfo_children():
+            w.destroy()
+        for c, name in enumerate(self._WEEKDAYS):
+            tk.Label(
+                self._grid, text=name, width=4, bg=theme.CARD, fg=theme.MUTED,
+            ).grid(row=0, column=c)
+        weeks = calendar.Calendar(firstweekday=0).monthdayscalendar(self._year, self._month)
+        for r, week in enumerate(weeks, start=1):
+            for c, day in enumerate(week):
+                if day == 0:
+                    tk.Label(self._grid, text="", width=4, bg=theme.CARD).grid(row=r, column=c)
+                    continue
+                d = date(self._year, self._month, day)
+                is_sel = d == self._selected
+                is_today = d == self._today
+                bg = theme.ACCENT if is_sel else theme.CARD
+                fg = "#ffffff" if is_sel else (theme.LINK if is_today else theme.FG)
+                cell = tk.Label(
+                    self._grid, text=str(day), width=4, pady=3, bg=bg, fg=fg, cursor="hand2",
+                )
+                cell.grid(row=r, column=c, padx=1, pady=1)
+                cell.bind("<Button-1>", lambda e, d=d: self._pick(d))
+                if not is_sel:
+                    cell.bind("<Enter>", lambda e, w=cell: w.configure(bg=theme.BTN_HOVER))
+                    cell.bind("<Leave>", lambda e, w=cell: w.configure(bg=theme.CARD))
+
+    def _pick(self, d: date | None):
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+        self._on_pick(d)
+
