@@ -212,6 +212,183 @@ MAX_PREVIEW_SECONDS = 30
 MERGE_HISTORY_MAX = 2000  # số cặp (video,audio) tối đa lưu lại để tránh lặp giữa các lần chạy
 
 
+# --- Review + giọng đọc (kịch bản Gemini -> TTS -> ghép audio) ---
+# Các khóa lưu trong file cấu hình (cfg) — đọc qua `read_review_settings(cfg)`:
+#   review_script_model     model Gemini viết kịch bản (trống = dùng model mặc định bên dưới;
+#                           model dự phòng dùng chung khóa "gemini_fallback_model")
+#   review_voice_sample     ĐƯỜNG DẪN file giọng mẫu trên máy (chỉ lưu đường dẫn, không sao
+#                           chép/commit file; để trống = chưa chọn)
+#   review_words_per_second tốc độ đọc (từ/giây) dùng để ước lượng số từ theo độ dài video
+#                           (tự hiệu chỉnh sau mỗi lần Tạo giọng nói; review_wps_samples = số lần đã đo)
+#   review_style            phong cách lời đọc (xem REVIEW_STYLE_OPTIONS)
+#   review_style_prompt     hướng dẫn tự điền, chỉ dùng khi review_style = "custom"
+DEFAULT_REVIEW_SCRIPT_MODEL = DEFAULT_GEMINI_MODEL
+DEFAULT_REVIEW_WORDS_PER_SECOND = 4.1   # đo thực tế với giọng VieNeu: 86 từ đọc hết 18,2 giây ở tốc độ 1,15×
+MIN_REVIEW_WORDS_PER_SECOND = 1.0
+MAX_REVIEW_WORDS_PER_SECOND = 6.0
+
+REVIEW_STYLE_KOC = "koc"
+REVIEW_STYLE_NATURAL = "natural"
+REVIEW_STYLE_LIVELY = "lively"
+REVIEW_STYLE_EXPERT = "expert"
+REVIEW_STYLE_HUMOR = "humor"
+REVIEW_STYLE_CUSTOM = "custom"
+DEFAULT_REVIEW_STYLE = REVIEW_STYLE_KOC
+REVIEW_STYLE_OPTIONS = {
+    "KOC review đời thường (TikTok/Reels)": REVIEW_STYLE_KOC,
+    "Tự nhiên, kể chuyện": REVIEW_STYLE_NATURAL,
+    "Hào hứng, thu hút": REVIEW_STYLE_LIVELY,
+    "Chuyên gia, đáng tin": REVIEW_STYLE_EXPERT,
+    "Hài hước, gần gũi": REVIEW_STYLE_HUMOR,
+    "Tự điền hướng dẫn": REVIEW_STYLE_CUSTOM,
+}
+# Gợi ý phong cách đưa vào prompt (phần "yêu cầu bổ sung" của người dùng).
+REVIEW_STYLE_HINTS = {
+    # KOC: phần hướng dẫn chi tiết nằm trong system instruction (review_script.py),
+    # ở đây chỉ để dòng mô tả ngắn cho đủ bảng.
+    REVIEW_STYLE_KOC: "Giọng KOC/Reviewer đời thường: gần gũi, nhiệt tình, ngôn ngữ nói tự nhiên của người Việt.",
+    REVIEW_STYLE_NATURAL: "Giọng kể tự nhiên, như người thật đang kể lại cho bạn bè nghe.",
+    REVIEW_STYLE_LIVELY: "Giọng hào hứng, nhịp nhanh, tạo tò mò và muốn xem tiếp.",
+    REVIEW_STYLE_EXPERT: "Giọng điềm đạm, như chuyên gia nhận xét khách quan, có căn cứ từ video.",
+    REVIEW_STYLE_HUMOR: "Giọng hài hước, gần gũi, dí dỏm vừa phải, không lố.",
+}
+
+
+# --- Thông tin đầu vào của prompt KOC (xem review_script.build_system_instruction) ---
+# Khóa trong cfg: review_product, review_duration, review_use_video_len,
+# review_address_terms, review_slang
+DEFAULT_REVIEW_PRODUCT = ""
+DEFAULT_REVIEW_DURATION = 15          # giây — thời lượng mục tiêu của lời đọc
+MIN_REVIEW_DURATION = 5
+MAX_REVIEW_DURATION = 120
+DEFAULT_REVIEW_ADDRESS_TERMS = "Bác nào, Bà con, Các chị em"
+DEFAULT_REVIEW_SLANG = (
+    "chân ái, nhàn tênh, nhàn cái thân, trong một nốt nhạc, ngon ơ, chốt ngay, rinh ngay"
+)
+
+
+# --- Đọc giọng (TTS) — xem tts_local.py ---
+# Khóa trong cfg: tts_backend, tts_gemini_model, tts_gemini_voice, tts_vieneu_voice
+# (giọng mẫu để nhân bản giọng dùng chung khóa "review_voice_sample").
+TTS_BACKEND_VIENEU = "vieneu"
+TTS_BACKEND_GEMINI = "gemini"
+DEFAULT_TTS_BACKEND = TTS_BACKEND_VIENEU
+TTS_BACKEND_OPTIONS = {
+    "VieNeu-TTS (chạy trên máy, hỗ trợ giọng mẫu)": TTS_BACKEND_VIENEU,
+    "Gemini TTS (online, cần API Key)": TTS_BACKEND_GEMINI,
+}
+DEFAULT_TTS_GEMINI_MODEL = "gemini-2.5-flash-preview-tts"
+DEFAULT_TTS_GEMINI_VOICE = "Kore"
+GEMINI_TTS_VOICES = [
+    "Kore", "Puck", "Zephyr", "Charon", "Fenrir", "Leda", "Orus", "Aoede",
+    "Callirrhoe", "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba",
+    "Despina", "Erinome", "Algenib", "Rasalgethi", "Laomedeia", "Achernar",
+    "Alnilam", "Schedar", "Gacrux", "Pulcherrima", "Achird", "Zubenelgenubi",
+    "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat",
+]
+TTS_PREVIEW_MAX_WORDS = 25   # nghe thử: chỉ đọc câu đầu, tối đa chừng này từ
+
+
+def _to_float(value, default: float) -> float:
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return default
+    # NaN / vô cực -> dùng mặc định
+    return x if x == x and x not in (float("inf"), float("-inf")) else default
+
+
+def read_review_settings(cfg: dict) -> dict:
+    """Đọc + chuẩn hoá cấu hình Review từ `cfg` (giá trị lạ/hỏng quay về mặc định,
+    không bao giờ ném lỗi). Trả về dict:
+      script_model, voice_sample, words_per_second, style, style_prompt, style_hint
+    `style_hint` là câu hướng dẫn phong cách sẵn sàng đưa vào prompt (rỗng nếu
+    style = custom mà chưa điền prompt)."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+
+    model = str(cfg.get("review_script_model") or "").strip() or DEFAULT_REVIEW_SCRIPT_MODEL
+    voice = str(cfg.get("review_voice_sample") or "").strip()
+
+    wps = _to_float(cfg.get("review_words_per_second"), DEFAULT_REVIEW_WORDS_PER_SECOND)
+    wps = max(MIN_REVIEW_WORDS_PER_SECOND, min(MAX_REVIEW_WORDS_PER_SECOND, wps))
+
+    style = cfg.get("review_style")
+    if style not in REVIEW_STYLE_OPTIONS.values():
+        style = DEFAULT_REVIEW_STYLE
+    style_prompt = str(cfg.get("review_style_prompt") or "").strip()
+    hint = style_prompt if style == REVIEW_STYLE_CUSTOM else REVIEW_STYLE_HINTS.get(style, "")
+
+    return {
+        "script_model": model,
+        "voice_sample": voice,
+        "words_per_second": wps,
+        "style": style,
+        "style_prompt": style_prompt,
+        "style_hint": hint,
+    }
+
+
+# --- Cài đặt giọng đọc (thanh trượt ở cột phải của tab Kịch bản & Giọng đọc) ---
+# Khóa trong cfg: tts_stability, tts_speed, tts_pause_enabled, tts_pause_sentence,
+# tts_pause_comma, tts_autofit
+#   stability : 0 (biểu cảm) .. 5 (ổn định). Đổi thành "temperature" của model:
+#               ổn định cao -> temperature thấp -> đọc đều, ít biến thiên.
+#   speed     : hệ số tốc độ (atempo của ffmpeg), 1.0 = bình thường.
+#   pause_*   : giây im lặng chèn sau dấu kết câu (. ! ? …) / sau dấu phẩy (, ; :).
+#   autofit   : tự chỉnh tốc độ để audio khớp đúng thời lượng mục tiêu.
+MIN_TTS_STABILITY, MAX_TTS_STABILITY, DEFAULT_TTS_STABILITY = 0.0, 5.0, 2.8
+MIN_TTS_SPEED, MAX_TTS_SPEED, DEFAULT_TTS_SPEED = 0.5, 1.5, 1.0
+MIN_TTS_PAUSE, MAX_TTS_PAUSE_SENTENCE, MAX_TTS_PAUSE_COMMA = 0.0, 1.5, 0.6
+DEFAULT_TTS_PAUSE_SENTENCE = 0.35
+DEFAULT_TTS_PAUSE_COMMA = 0.15
+AUTOFIT_MIN_SPEED, AUTOFIT_MAX_SPEED = 0.8, 1.5   # giới hạn khi tự chỉnh để khớp thời lượng
+TTS_HISTORY_MAX = 100
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def read_tts_settings(cfg: dict) -> dict:
+    """Đọc + chuẩn hoá cài đặt giọng đọc từ `cfg` (giá trị hỏng -> mặc định, không ném lỗi)."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+
+    def flag(key: str, default: bool) -> bool:
+        v = cfg.get(key, default)
+        return v if isinstance(v, bool) else default
+
+    return {
+        "stability": _clamp(_to_float(cfg.get("tts_stability"), DEFAULT_TTS_STABILITY),
+                            MIN_TTS_STABILITY, MAX_TTS_STABILITY),
+        "speed": _clamp(_to_float(cfg.get("tts_speed"), DEFAULT_TTS_SPEED),
+                        MIN_TTS_SPEED, MAX_TTS_SPEED),
+        "pause_enabled": flag("tts_pause_enabled", True),
+        "pause_sentence": _clamp(_to_float(cfg.get("tts_pause_sentence"), DEFAULT_TTS_PAUSE_SENTENCE),
+                                 MIN_TTS_PAUSE, MAX_TTS_PAUSE_SENTENCE),
+        "pause_comma": _clamp(_to_float(cfg.get("tts_pause_comma"), DEFAULT_TTS_PAUSE_COMMA),
+                              MIN_TTS_PAUSE, MAX_TTS_PAUSE_COMMA),
+        "autofit": flag("tts_autofit", False),
+    }
+
+
+def read_koc_brief(cfg: dict) -> dict:
+    """Đọc thông tin đầu vào của prompt KOC (sản phẩm, thời lượng, xưng hô, từ khóa)."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    try:
+        duration = int(float(cfg.get("review_duration", DEFAULT_REVIEW_DURATION)))
+    except (TypeError, ValueError, OverflowError):
+        duration = DEFAULT_REVIEW_DURATION
+    duration = max(MIN_REVIEW_DURATION, min(MAX_REVIEW_DURATION, duration))
+    use_len = cfg.get("review_use_video_len", False)
+    return {
+        "product": str(cfg.get("review_product") or DEFAULT_REVIEW_PRODUCT).strip(),
+        "duration": duration,
+        "use_video_len": use_len if isinstance(use_len, bool) else False,
+        "address_terms": str(cfg.get("review_address_terms") or DEFAULT_REVIEW_ADDRESS_TERMS).strip(),
+        "slang": str(cfg.get("review_slang") or DEFAULT_REVIEW_SLANG).strip(),
+    }
+
+
 def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:

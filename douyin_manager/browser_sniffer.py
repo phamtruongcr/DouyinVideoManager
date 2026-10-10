@@ -397,6 +397,29 @@ _PLATFORM_DOMAIN = {
 _CAPTCHA_URL_HINTS = ("captcha", "verify", "login")
 _CAPTCHA_TEXT_HINTS = ("验证码中间页", "captcha", "请完成下列验证", "拖动滑块", "Verify to continue")
 
+# Trang kênh hiện "服务异常，重新刷新拉取数据" (lỗi tải danh sách bài đăng phía Douyin): bấm "刷新" trên
+# trang thường gọi lại được API; thử vài lần trước khi bỏ cuộc.
+_SERVICE_ERROR_HINTS = ("服务异常", "重新刷新", "拉取数据")
+SERVICE_RETRIES = 3
+
+
+def _service_error_now(page) -> bool:
+    """Trang đang hiện thông báo lỗi dịch vụ (服务异常 ...) thay cho danh sách video?"""
+    try:
+        text = page.inner_text("body")[:4000]
+    except Exception:  # noqa: BLE001
+        return False
+    return any(h in text for h in _SERVICE_ERROR_HINTS)
+
+
+def _click_refresh(page) -> bool:
+    """Bấm chữ "刷新" (làm mới) trên trang; không bấm được thì trả False để nơi gọi tải lại trang."""
+    try:
+        page.get_by_text("刷新", exact=True).first.click(timeout=2500)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
 
 def sniff_profile_videos(
     platform: str,
@@ -437,10 +460,19 @@ def sniff_profile_videos(
     seen: set[str] = set()
     got = 0
 
+    seen_urls: list[str] = []    # URL aweme đã thấy (chẩn đoán khi không bắt được video)
+
     def on_response(resp):
         pending.append(resp)
+        try:
+            u = resp.url
+            if "aweme" in u and len(seen_urls) < 40:
+                seen_urls.append(f"{resp.status} {u[:140]}")
+        except Exception:  # noqa: BLE001
+            pass
 
     ctx = None
+    solved_captcha = False
     with sync_playwright() as pw:
         browser = _launch_browser(pw, log, headless=headless)
         try:
@@ -518,24 +550,57 @@ def sniff_profile_videos(
             if drain() or stop_flag():
                 return
 
+            solved_captcha = False
             if interactive and got == 0 and _captcha_now(page):
                 log("Douyin đang hiện captcha — hãy kéo thanh trượt trong cửa sổ trình duyệt "
-                    f"vừa mở (chờ tối đa {CAPTCHA_WAIT_S}s)...")
+                    f"vừa mở (chờ tối đa {CAPTCHA_WAIT_S}s). ĐỪNG đóng cửa sổ đó.")
                 deadline = time.time() + CAPTCHA_WAIT_S
                 while time.time() < deadline and not stop_flag():
                     page.wait_for_timeout(1500)
                     if drain():
                         return
                     if not _captcha_now(page):
+                        solved_captcha = True
                         break
-                if got == 0 and not stop_flag() and not _captcha_now(page):
-                    try:
-                        page.reload(wait_until="domcontentloaded")
-                        page.wait_for_timeout(3000)
-                    except PWError:
-                        pass
-                    if drain() or stop_flag():
-                        return
+                if solved_captcha:
+                    log("Đã qua captcha — đang chờ trang kênh tải danh sách video...")
+                    # Đợi trang tự tải (mạng sang Trung Quốc chậm); nếu vẫn chưa có thì tải lại 1 lần
+                    for attempt in range(2):
+                        for _ in range(20):
+                            if stop_flag():
+                                return
+                            page.wait_for_timeout(1000)
+                            if drain():
+                                return
+                            if got:
+                                break
+                        if got:
+                            break
+                        if attempt == 0:
+                            logger.info("Chưa thấy video sau captcha -> tải lại trang")
+                            try:
+                                page.reload(wait_until="domcontentloaded")
+                            except PWError:
+                                pass
+
+            # Trang báo "服务异常，重新刷新拉取数据": tự bấm "刷新" (hoặc tải lại trang) vài lần
+            if got == 0 and not stop_flag() and not (interactive and _captcha_now(page)):
+                for attempt in range(1, SERVICE_RETRIES + 1):
+                    if stop_flag() or not _service_error_now(page):
+                        break
+                    log(f"Douyin báo 服务异常 (lỗi tải danh sách) — thử làm mới lần {attempt}/{SERVICE_RETRIES}...")
+                    if not _click_refresh(page):
+                        try:
+                            page.reload(wait_until="domcontentloaded")
+                        except PWError:
+                            pass
+                    for _ in range(6):
+                        page.wait_for_timeout(1000)
+                        if drain() or got:
+                            break
+                    if got:
+                        break
+                    page.wait_for_timeout(1500 * attempt)
 
             idle = 0
             for _ in range(MAX_SCROLLS):
@@ -551,18 +616,43 @@ def sniff_profile_videos(
                 if drain() or stop_flag():
                     break
                 idle = idle + 1 if got == before else 0
-                if idle >= IDLE_SCROLLS_LIMIT:
+                if idle >= (15 if interactive else IDLE_SCROLLS_LIMIT):
                     break
 
             logger.info("Sniff kết thúc | bắt được %d video | url cuối=%s", got, page.url[:160])
             if got == 0:
+                logger.warning("Các URL 'aweme' đã thấy (%d): %s", len(seen_urls),
+                               " || ".join(seen_urls) if seen_urls else "(không có)")
+                try:
+                    txt = page.inner_text("body")[:300].replace("\n", " | ")
+                    logger.warning("Chữ hiển thị trên trang: %s", txt)
+                except Exception:  # noqa: BLE001
+                    pass
+                if interactive:
+                    try:
+                        from .config import LOG_DIR
+                        LOG_DIR.mkdir(parents=True, exist_ok=True)
+                        shot = LOG_DIR / "last_sniff.png"
+                        page.screenshot(path=str(shot))
+                        logger.warning("Đã lưu ảnh chụp trang: %s", shot)
+                    except Exception:  # noqa: BLE001
+                        pass
                 final_url = page.url.lower()
+                service_err = _service_error_now(page)
                 try:
                     body = (page.content() or "")[:6000]
                 except Exception:  # noqa: BLE001
                     body = ""
                 logger.warning("Không bắt được video nào | tiêu đề trang=%r | đầu trang: %s",
                                _safe_title(page), body[:200].replace("\n", " "))
+                if platform == "douyin" and service_err:
+                    raise SnifferBlocked(
+                        "Chính trang Douyin báo \"服务异常，重新刷新拉取数据\" (lỗi phía Douyin / kiểm soát "
+                        "rủi ro), đã tự làm mới nhưng vẫn không có danh sách video — mở kênh đó bằng trình "
+                        "duyệt thường cũng sẽ thấy lỗi này. Thử: đợi vài phút rồi lấy lại; đổi mạng/IP "
+                        "(tắt hoặc đổi VPN); đăng nhập lại douyin.com rồi cập nhật Cookie trong Cài đặt; "
+                        "hoặc tải từng video bằng link."
+                    )
                 if platform == "douyin" and (
                     any(h in final_url for h in _CAPTCHA_URL_HINTS)
                     or any(h in body for h in _CAPTCHA_TEXT_HINTS)
@@ -580,8 +670,16 @@ def sniff_profile_videos(
                     "Trình duyệt ẩn không bắt được video nào (kênh trống/riêng tư hoặc nền tảng "
                     "đang chặn bot)."
                 )
+        except PWError as exc:
+            msg = str(exc).splitlines()[0][:200] if str(exc) else "lỗi Playwright"
+            if "closed" in msg.lower():
+                raise SnifferBlocked(
+                    "Cửa sổ trình duyệt đã bị đóng trước khi xong (đừng đóng cửa sổ khi đang "
+                    "chờ giải captcha / tải danh sách)."
+                ) from exc
+            raise SnifferUnavailable(f"Lỗi Playwright: {msg}") from exc
         finally:
-            if state_path and got > 0:
+            if state_path and (got > 0 or solved_captcha):
                 try:
                     ctx.storage_state(path=state_path)
                 except Exception:  # noqa: BLE001

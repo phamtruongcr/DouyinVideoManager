@@ -51,6 +51,7 @@ from .config import (
     LOG_LEVEL_OPTIONS,
 )
 from .audio_merge_gui import AudioMergeTab
+from .script_voice_gui import ScriptVoiceTab
 from .download_history import DownloadHistory, make_key
 from . import app_logger
 from .app_logger import get_logger
@@ -253,6 +254,12 @@ class DouyinApp(tk.Tk):
 
     def _on_close(self):
         """Đóng app: dừng ghép đang chạy (nếu có) và xóa các bản xem thử tạm."""
+        script_tab = getattr(self, "script_tab", None)
+        if script_tab is not None:
+            try:
+                script_tab.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
         merge_tab = getattr(self, "merge_tab", None)
         was_merging = False
         if merge_tab is not None:
@@ -273,8 +280,23 @@ class DouyinApp(tk.Tk):
 
         self.tab_download = ttk.Frame(self.notebook)
         self.merge_tab = AudioMergeTab(self.notebook, self.cfg)
+        # Tab kịch bản + giọng đọc: lưu <tên video>.mp3 vào thư mục Audio của tab Ghép
+        self.script_tab = ScriptVoiceTab(
+            self.notebook, self.cfg, self.history,
+            get_audio_dir=lambda: self.merge_tab.audio_dir,
+            set_audio_dir=self.merge_tab.set_audio_dir,
+            get_ffmpeg=lambda: self.merge_tab.ffmpeg_path,
+            get_ffprobe=lambda: self.merge_tab.ffprobe_path,
+        )
         self.notebook.add(self.tab_download, text="⬇  Tải video")
+        self.notebook.add(self.script_tab, text="✎  Kịch bản & Giọng đọc")
         self.notebook.add(self.merge_tab, text="♫  Ghép Audio vào Video")
+        # Mở tab kịch bản thì làm mới danh sách (có thể vừa tải xong video mới)
+        self.notebook.bind(
+            "<<TabChanged>>",
+            lambda e: self.script_tab.on_tab_shown()
+            if self.notebook.current == 1 else None,
+        )
 
         self._build_download_tab(self.tab_download)
 

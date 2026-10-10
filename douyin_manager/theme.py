@@ -59,6 +59,11 @@ SEG_SELECTED = "#383d49"  # tab con đang chọn
 MAIN_SEL_BG = "#1b3157"   # tab chính đang chọn
 MAIN_SEL_BORDER = "#2f6fdc"
 
+AI_BG = "#4f3fc4"          # nút hành động AI (Tạo kịch bản): tím
+AI_HOVER = "#6152dc"
+AI_BORDER = "#8b7cff"
+DIM = "#6b7280"            # chữ rất nhẹ (dòng xem trước)
+
 TICK_GREEN = "#22c55e"      # màu dấu tích xanh
 TICK_GREEN_DIM = "#2f6f4a"
 
@@ -329,5 +334,25 @@ def apply_dark_theme(root: tk.Misc) -> ttk.Style:
         style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
     except tk.TclError:
         pass
+
+    # ---------------------------------------- Kiểu riêng cho tab Kịch bản & Giọng đọc --
+    style.configure(
+        "Secondary.TButton", background=BG, foreground="#b8bdc9", bordercolor="#3a4050",
+        darkcolor=BG, lightcolor=BG, focuscolor=BG, padding=(16, 9), relief="flat",
+    )
+    style.map(
+        "Secondary.TButton",
+        background=[("disabled", BG), ("pressed", BTN_PRESS), ("active", BTN)],
+        darkcolor=[("disabled", BG), ("pressed", BTN_PRESS), ("active", BTN)],
+        lightcolor=[("disabled", BG), ("pressed", BTN_PRESS), ("active", BTN)],
+        foreground=[("disabled", DISABLED_FG), ("active", FG)],
+        bordercolor=[("active", "#5a6274")],
+    )
+    style.configure("Icon.TButton", padding=(4, 3), width=3)
+    style.configure("Dim.TLabel", background=CARD, foreground=DIM, font=("", 9))
+    style.configure(
+        "Thin.Horizontal.TScale", background=CARD, troughcolor=FIELD_BORDER,
+        bordercolor=CARD, darkcolor=ACCENT, lightcolor=ACCENT, sliderlength=14,
+    )
 
     return style

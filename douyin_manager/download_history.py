@@ -195,6 +195,19 @@ class DownloadHistory:
             self.last_error = f"Không đọc được lịch sử tải: {exc}"
             return {}
 
+    def list_recent(self, limit: int = 300) -> list[HistoryRecord]:
+        """Các video đã tải gần nhất (mới nhất trước), tối đa `limit` bản ghi."""
+        try:
+            with self._lock, self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM downloads ORDER BY downloaded_at DESC LIMIT ?",
+                    (max(1, int(limit)),),
+                ).fetchall()
+            return [self._row_to_record(r) for r in rows]
+        except (sqlite3.Error, OSError) as exc:
+            self.last_error = f"Không đọc được lịch sử tải: {exc}"
+            return []
+
     def count(self) -> int:
         try:
             with self._lock, self._connect() as conn:

@@ -67,6 +67,16 @@ class DownloadHistoryTests(unittest.TestCase):
         self.assertTrue(self.h.clear())
         self.assertEqual(self.h.count(), 0)
 
+    def test_list_recent_newest_first_and_limit(self):
+        import time
+        for i in range(5):
+            self.h.record("douyin", str(i), f"t{i}")
+            time.sleep(0.01)
+        recent = self.h.list_recent(3)
+        self.assertEqual([r.video_id for r in recent], ["4", "3", "2"])
+        self.assertEqual(len(self.h.list_recent()), 5)
+        self.assertEqual(DownloadHistory(Path(self._tmp.name) / "empty.db").list_recent(), [])
+
     def test_persists_across_instances(self):
         self.h.record("douyin", "1", "a")
         self.assertTrue(DownloadHistory(self.db).contains("douyin", "1"))

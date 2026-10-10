@@ -21,6 +21,17 @@ Hỗ trợ ba nền tảng: **Douyin**, **TikTok** và **Facebook** (video thư�
 - **Tự cập nhật yt-dlp** ở nền khi mở app (giới hạn tần suất 12 giờ/lần). Bản đóng gói PyInstaller không tự cập nhật được, cần build lại.
 - **Tự lấy Cookie từ trình duyệt** (Firefox, Chrome, Edge, Brave, Opera, Vivaldi, Chromium, Safari) hoặc dán thủ công.
 
+### Tab "Kịch bản & Giọng đọc"
+Luồng một video: **chọn video** (từ *Lịch sử tải* hoặc một thư mục, hoặc chọn 1 file) → **✨ Tạo kịch bản** (Gemini xem video, viết lời đọc thuần văn bản — không tiêu đề/markdown/emoji/mốc thời gian, số viết thành chữ, giới hạn số từ tự theo độ dài video) → kịch bản hiện trong ô soạn thảo, **sửa tự do** → **🎙 Đọc & lưu mp3** → lưu `<tên video>.mp3` vào **Thư mục Audio của tab Ghép Audio**, để tab đó tự ghép cặp theo tên file.
+- **Prompt KOC/Reviewer** (phong cách mặc định): nhập **Sản phẩm**, **Thời lượng mục tiêu** (mặc định 15 giây, hoặc tick *Theo độ dài video*), tuỳ chỉnh **Xưng hô** ("Bác nào", "Bà con", "Các chị em"...) và **Từ khóa review** ("chân ái", "nhàn tênh", "ngon ơ", "chốt ngay", "rinh ngay"...). Kịch bản theo cấu trúc Hook → 2-3 tính năng → chốt đơn. App tự tính số từ cần viết từ thời lượng, tốc độ đọc và ngắt nghỉ; nếu Gemini viết lệch khoảng cho phép thì tự nhờ viết lại 1 lần (thay vì cắt cụt đoạn kết). Ô **Ghi chú / tính năng** để dán thêm tính năng sản phẩm.
+- **Cài đặt giọng đọc** (cột phải, tab *Cài đặt*): **Độ ổn định giọng** (biểu cảm ↔ ổn định, đổi thành temperature của model), **Tốc độ đọc** (0.5×–1.5×, ffmpeg `atempo`, giữ cao độ), **Tự chỉnh tốc độ để khớp thời lượng mục tiêu**, **Ngắt nghỉ** theo dấu câu (sau câu / sau dấu phẩy, chỉnh bằng giây; Gemini TTS chỉ ngắt theo câu để đỡ tốn quota). Tab *Lịch sử* liệt kê các file audio đã lưu (double-click để phát).
+- Backend giọng đọc: **VieNeu-TTS** (chạy trên máy, nhân bản giọng từ *file giọng mẫu*) hoặc **Gemini TTS** (online; chọn giọng dựng sẵn, không dùng giọng mẫu).
+- **Giọng đã lưu**: chọn file giọng mẫu rồi bấm **💾 Lưu giọng này** để đặt tên; file được sao chép vào `~/.douyin_video_manager_voices/` nên không mất khi xóa file gốc. Chọn lại giọng trong ô *Giọng đã lưu*; **🗑 Xóa giọng** chỉ xóa bản sao của app.
+- **Thư mục lưu audio** chọn ngay trên tab (dùng chung với tab Ghép Audio), có nút *Mở thư mục*.
+- **🔊 Nghe thử 1 câu** (câu đầu của kịch bản), thanh trạng thái, nút **■ Dừng**.
+- Cần Gemini API Key (Cài đặt) để tạo kịch bản. Có ffmpeg thì lưu mp3; không có thì lưu `.wav`.
+- VieNeu là tùy chọn: `pip install vieneu` (Python 3.10+). Lần đầu chạy sẽ tải model.
+
 ### Tab "Ghép Audio vào Video" (cần ffmpeg)
 - Ghép audio vào hàng loạt video: khớp theo tên file hoặc trộn ngẫu nhiên.
 - Chọn độ phân giải, chất lượng (CRF), tỉ lệ khung hình (16:9, 9:16, 1:1, 4:5, tùy chỉnh) và cách xử lý phần dư (crop / nền mờ / viền đen).
@@ -118,6 +129,11 @@ douyin_manager/
   ytdlp_updater.py              Tự cập nhật yt-dlp bằng pip
   browser_cookies.py            Đọc Cookie từ trình duyệt
   gemini_translator.py          Dịch tiêu đề bằng Gemini
+  gemini_client.py              Gọi Gemini REST dùng chung (retry, model dự phòng)
+  review_script.py              Gemini viết kịch bản review + lọc kết quả (số -> chữ, đếm từ)
+  tts_local.py                  Đọc giọng: VieNeu + Gemini TTS, PCM -> WAV -> mp3
+  voice_library.py              Thư viện giọng mẫu đã lưu (sao chép file vào thư mục riêng)
+  script_voice_gui.py           Tab "Kịch bản & Giọng đọc"
   download_history.py           Lịch sử video đã tải (SQLite)
   app_logger.py                 Ghi log ra file (xoay vòng, tự che Cookie/token)
   audio_merger.py               Logic ffmpeg ghép audio / chèn chữ / blur

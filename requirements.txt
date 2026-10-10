@@ -17,3 +17,7 @@ yt-dlp[default,curl-cffi]>=2025.1.1
 # Dùng Chrome/Edge có sẵn trên máy; nếu không có sẽ tự tải Chromium lần đầu.
 # (Không có Playwright thì app tự dùng yt-dlp như trước.)
 playwright>=1.45.0
+
+# Tùy chọn: đọc giọng chạy ngay trên máy (tab "Kịch bản & Giọng đọc", backend VieNeu-TTS).
+# Cần Python >= 3.10; không cài thì dùng backend Gemini TTS.
+# vieneu

@@ -851,10 +851,14 @@ class AudioMergeTab(ttk.Frame):
             initialdir=str(self.audio_dir) if self.audio_dir else str(Path.home()), parent=self,
         )
         if chosen:
-            self.audio_dir = Path(chosen)
-            self.audio_dir_var.set(chosen)
-            self.cfg["merge_audio_dir"] = chosen
-            save_config(self.cfg)
+            self.set_audio_dir(Path(chosen))
+
+    def set_audio_dir(self, path: Path):
+        """Đặt thư mục Audio (cũng được tab "Kịch bản & Giọng đọc" gọi để dùng chung)."""
+        self.audio_dir = Path(path)
+        self.audio_dir_var.set(str(path))
+        self.cfg["merge_audio_dir"] = str(path)
+        save_config(self.cfg)
 
     def _choose_output_dir(self):
         chosen = filedialog.askdirectory(

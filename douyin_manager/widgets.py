@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import calendar
 import tkinter as tk
+import tkinter.font as tkfont
 from datetime import date
 from tkinter import ttk
 
@@ -150,6 +151,95 @@ class AccentButton(tk.Label):
             self._bg = bg
             self._hover_bg = hover_bg or bg
         self._paint()
+
+
+class RoundedButton(tk.Canvas):
+    """Nút bo góc, có MÀU NỀN riêng (vẽ bằng Canvas nên giống nhau trên mọi hệ điều hành).
+    API giống AccentButton: `state(["disabled"])`, `state(["!disabled"])`, `invoke()`, `set_look()`.
+    `parent_bg`: màu nền của khung chứa nút (để 4 góc bo hòa vào nền)."""
+
+    def __init__(
+        self, master, text: str, command=None, bg: str = "#1a73e8",
+        hover_bg: str | None = None, fg: str = "#ffffff",
+        disabled_bg: str = theme.DISABLED_BTN_BG, disabled_fg: str = theme.DISABLED_BTN_FG,
+        padx: int = 18, pady: int = 7, font=("", 10, "bold"), radius: int = 10,
+        parent_bg: str = theme.BG, outline: str | None = None,
+    ):
+        self._font = tkfont.Font(master=master, font=font)
+        self._text, self._padx, self._pady, self._radius = text, padx, pady, radius
+        w, h = self._measure()
+        super().__init__(
+            master, width=w, height=h, bg=parent_bg, highlightthickness=0, bd=0, cursor="hand2",
+        )
+        self._command = command
+        self._bg, self._hover_bg, self._fg = bg, hover_bg or bg, fg
+        self._disabled_bg, self._disabled_fg = disabled_bg, disabled_fg
+        self._outline = outline
+        self._disabled = False
+        self._hover = False
+        self._draw()
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    def _measure(self) -> tuple[int, int]:
+        return (
+            self._font.measure(self._text) + 2 * self._padx,
+            self._font.metrics("linespace") + 2 * self._pady,
+        )
+
+    def _draw(self):
+        self.delete("all")
+        w, h, r = int(self.cget("width")), int(self.cget("height")), self._radius
+        r = min(r, h // 2, w // 2)
+        if self._disabled:
+            fill, fg, edge = self._disabled_bg, self._disabled_fg, self._disabled_bg
+        else:
+            fill = self._hover_bg if self._hover else self._bg
+            fg, edge = self._fg, (self._outline or fill)
+        x1, y1, x2, y2 = 1, 1, w - 1, h - 1
+        pts = [
+            x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+            x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+        ]
+        self.create_polygon(pts, smooth=True, fill=fill, outline=edge, width=1)
+        self.create_text(w // 2, h // 2, text=self._text, fill=fg, font=self._font)
+        self.configure(cursor="arrow" if self._disabled else "hand2")
+
+    def _set_hover(self, hover: bool):
+        self._hover = hover
+        self._draw()
+
+    def _on_release(self, event):
+        if self._disabled or self._command is None:
+            return
+        if 0 <= event.x <= self.winfo_width() and 0 <= event.y <= self.winfo_height():
+            self._command()
+
+    def state(self, flags=None):
+        if flags is None:
+            return ("disabled",) if self._disabled else ()
+        for flag in flags:
+            if flag == "disabled":
+                self._disabled = True
+            elif flag == "!disabled":
+                self._disabled = False
+        self._draw()
+        return ()
+
+    def invoke(self):
+        if not self._disabled and self._command is not None:
+            self._command()
+
+    def set_look(self, text: str | None = None, bg: str | None = None, hover_bg: str | None = None):
+        if text is not None:
+            self._text = text
+            w, h = self._measure()
+            self.configure(width=w, height=h)
+        if bg is not None:
+            self._bg = bg
+            self._hover_bg = hover_bg or bg
+        self._draw()
 
 
 class ScrollableFrame(ttk.Frame):
