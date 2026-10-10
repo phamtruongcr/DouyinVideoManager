@@ -381,16 +381,48 @@ _ORT_HINT = (
 )
 
 
+def _is_dll_error(exc: BaseException) -> bool:
+    return "dll load failed" in str(exc).lower()
+
+
+_DLL_HINT = (
+    " Máy có thể thiếu \"Microsoft Visual C++ Redistributable 2015-2022 (x64)\". "
+    "Tải và cài: https://aka.ms/vs/17/release/vc_redist.x64.exe rồi mở lại app và thử lại."
+)
+
+
+def _vieneu_hint(exc: BaseException) -> str:
+    if _is_ort_external_path_error(exc):
+        return _ORT_HINT
+    if _is_dll_error(exc):
+        return _DLL_HINT
+    return ""
+
+
 def _load_vieneu_engine():
     """Nạp engine VieNeu 1 lần rồi dùng lại (nạp model khá nặng)."""
     global _VIENEU_ENGINE
     with _VIENEU_LOCK:
         if _VIENEU_ENGINE is None:
+            from . import vieneu_installer, vieneu_remote
+            if vieneu_installer.use_worker():
+                # App đóng gói: chạy VieNeu ở tiến trình riêng bằng Python của venv.
+                if not vieneu_installer.is_installed():
+                    raise TTSError(
+                        "Chưa cài VieNeu-TTS. Bấm nút \"Cài VieNeu\" trong tab Kịch bản & Giọng đọc, "
+                        "hoặc chọn backend Gemini TTS."
+                    )
+                try:
+                    _VIENEU_ENGINE = vieneu_remote.VieNeuWorker()
+                except Exception as exc:  # noqa: BLE001
+                    raise TTSError(f"Không khởi động được VieNeu-TTS: {exc}.{_vieneu_hint(exc)}") from exc
+                return _VIENEU_ENGINE
             try:
                 from vieneu import Vieneu  # type: ignore
             except ImportError as exc:
                 raise TTSError(
-                    "Chưa cài VieNeu-TTS. Chạy: pip install vieneu (cần Python 3.10 trở lên), "
+                    "Chưa cài VieNeu-TTS. Bấm nút \"Cài VieNeu\" trong tab Kịch bản & Giọng đọc "
+                    "(hoặc chạy: pip install vieneu, cần Python 3.10 trở lên), "
                     "hoặc chọn backend Gemini TTS."
                 ) from exc
             try:
@@ -407,8 +439,7 @@ def _load_vieneu_engine():
                         raise
                     _VIENEU_ENGINE = Vieneu()
             except Exception as exc:  # noqa: BLE001
-                hint = _ORT_HINT if _is_ort_external_path_error(exc) else ""
-                raise TTSError(f"Không khởi động được VieNeu-TTS: {exc}.{hint}") from exc
+                raise TTSError(f"Không khởi động được VieNeu-TTS: {exc}.{_vieneu_hint(exc)}") from exc
         return _VIENEU_ENGINE
 
 

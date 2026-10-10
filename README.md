@@ -30,7 +30,9 @@ Luồng một video: **chọn video** (từ *Lịch sử tải* hoặc một th�
 - **Thư mục lưu audio** chọn ngay trên tab (dùng chung với tab Ghép Audio), có nút *Mở thư mục*.
 - **🔊 Nghe thử 1 câu** (câu đầu của kịch bản), thanh trạng thái, nút **■ Dừng**.
 - Cần Gemini API Key (Cài đặt) để tạo kịch bản. Có ffmpeg thì lưu mp3; không có thì lưu `.wav`.
-- VieNeu là tùy chọn: `pip install vieneu` (Python 3.10+). Lần đầu chạy sẽ tải model.
+- VieNeu là tùy chọn (Python 3.10+). Cài ngay trong app: tab **Kịch bản & Giọng đọc** → chọn backend VieNeu-TTS → bấm **⬇ Cài VieNeu** (hoặc tự hỏi cài khi bạn đọc giọng mà chưa có). Cũng có thể cài tay: `pip install vieneu`. Lần đầu chạy sẽ tải model.
+  Với bản đóng gói (.exe/.app), app cần một Python 3.10+ có sẵn trên máy (khuyên dùng 3.12/3.11) chỉ để cài: nó tạo môi trường riêng `~/.douyin_vieneu_venv`, cài VieNeu vào đó và chạy VieNeu ở tiến trình riêng (không phải trùng phiên bản Python với bản đóng gói). Log chạy: `~/.douyin_vieneu_venv/worker.log`. Thư mục cũ `~/.douyin_video_manager_libs` (bản trước) có thể xóa.
+- Build Windows bằng Python 3.11 (khuyên dùng, vì VieNeu/kaldi-native-fbank có bản dựng sẵn cho 3.11): chạy `build_windows_py311.bat` (tự tạo venv `.venv-build311`). Đặt `set BUNDLE_VIENEU=1` trước khi chạy nếu muốn đóng gói sẵn VieNeu vào .exe (rất nặng).
 
 ### Tab "Ghép Audio vào Video" (cần ffmpeg)
 - Ghép audio vào hàng loạt video: khớp theo tên file hoặc trộn ngẫu nhiên.
@@ -132,6 +134,8 @@ douyin_manager/
   gemini_client.py              Gọi Gemini REST dùng chung (retry, model dự phòng)
   review_script.py              Gemini viết kịch bản review + lọc kết quả (số -> chữ, đếm từ)
   tts_local.py                  Đọc giọng: VieNeu + Gemini TTS, PCM -> WAV -> mp3
+  vieneu_installer.py           Cài VieNeu bằng pip từ giao diện (luồng nền, báo tiến độ)
+  vieneu_remote.py              Chạy VieNeu ở tiến trình riêng (venv) cho bản đóng gói
   voice_library.py              Thư viện giọng mẫu đã lưu (sao chép file vào thư mục riêng)
   script_voice_gui.py           Tab "Kịch bản & Giọng đọc"
   download_history.py           Lịch sử video đã tải (SQLite)
@@ -152,3 +156,14 @@ python -m unittest discover -s tests -v
 ```
 
 Các module `fetch_filters.py`, `utils.py`, `download_history.py`, `audio_merger.py` không phụ thuộc giao diện nên dễ viết thêm test.
+
+## Đóng gói bộ cài Windows (Inno Setup)
+
+Bộ cài tự cài VC++ Runtime (nếu thiếu), Python 3.12 (nếu chưa có Python 3.10+, có thể bỏ chọn) và kèm sẵn ffmpeg/ffprobe.
+
+1. Cài [Inno Setup 6](https://jrsoftware.org/isdl.php) (một lần).
+2. Build exe: `build_windows_py311.bat` → `dist\DouyinVideoManager.exe`.
+3. Chạy `installer\build_installer.bat 1.0.0` (số 1.0.0 là phiên bản). Lần đầu nó tự chạy `installer\prepare_redist.bat` để tải VC++ Runtime, Python và ffmpeg vào `installer\redist\` (kiểm tra chữ ký số của hai file đầu).
+4. Kết quả: `installer\Output\DouyinVideoManager-Setup-1.0.0.exe`. Gửi file này cho người dùng.
+
+Nên thử bộ cài trên máy Windows sạch (Windows Sandbox hoặc máy ảo) trước khi phát hành. Bộ cài chưa ký số nên SmartScreen có thể cảnh báo "Unknown publisher".

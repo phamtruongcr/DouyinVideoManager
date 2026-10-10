@@ -83,6 +83,7 @@ from .tts_local import (
     wav_peaks,
 )
 from . import voice_library as vlib
+from . import vieneu_installer as vinst
 from .audio_bar import AudioBar, format_clock
 from .ui_icons import Tooltip
 from .widgets import (
@@ -141,6 +142,9 @@ class ScriptVoiceTab(ttk.Frame):
         self._dur_queue: queue.Queue = queue.Queue()
         self._dur_gen = 0                                       # tăng mỗi lần làm mới danh sách
         self._autofill_pending: Optional[Path] = None          # video vừa chọn, đang chờ đọc thời lượng
+
+        self._install_queue: queue.Queue = queue.Queue()   # tiến độ cài VieNeu (tách khỏi job đọc giọng)
+        self._installing = False
 
         self._build_ui()
         self.refresh_video_list()
@@ -395,6 +399,19 @@ class ScriptVoiceTab(ttk.Frame):
         backend_combo.grid(row=0, column=1, sticky="ew", pady=3)
         backend_combo.bind("<<ComboboxSelected>>", lambda e: self._on_backend_changed())
 
+        # VieNeu: trạng thái cài đặt + nút cài ngay trên giao diện
+        self.install_row = ttk.Frame(vbox)
+        self.install_row.columnconfigure(0, minsize=100)
+        self.install_row.columnconfigure(1, weight=1)
+        ttk.Label(self.install_row, text="Thư viện").grid(row=0, column=0, sticky="w", pady=3)
+        ir = ttk.Frame(self.install_row)
+        ir.grid(row=0, column=1, sticky="ew", pady=3)
+        self.install_status_var = tk.StringVar(value="")
+        ttk.Label(ir, textvariable=self.install_status_var, style="Muted.TLabel").pack(side="left")
+        self.install_btn = ttk.Button(ir, text="⬇ Cài VieNeu", command=self.on_install_vieneu)
+        self.install_btn.pack(side="right")
+        self._refresh_install_state()
+
         # VieNeu: giọng mẫu + giọng đã lưu
         self.sample_row = ttk.Frame(vbox)
         self.sample_row.columnconfigure(0, minsize=100)
@@ -612,11 +629,14 @@ class ScriptVoiceTab(ttk.Frame):
         kind = self._backend_kind()
         self.sample_row.pack_forget()
         self.gemini_row.pack_forget()
+        self.install_row.pack_forget()
         anchor = self._backend_row
         if kind == TTS_BACKEND_VIENEU:
-            self.sample_row.pack(fill="x", after=anchor)
+            self._refresh_install_state()
+            self.install_row.pack(fill="x", after=anchor)
+            self.sample_row.pack(fill="x", after=self.install_row)
             self._backend_tip.text = (
-                "VieNeu-TTS chạy trên máy (pip install vieneu, Python 3.10+). Có file giọng mẫu thì "
+                "VieNeu-TTS chạy trên máy (Python 3.10+; bấm \"Cài VieNeu\" bên dưới nếu chưa có). Có file giọng mẫu thì "
                 "nhân bản giọng đó (khoảng 3–8 giây, rõ tiếng, không nhạc nền); để trống thì dùng giọng mặc định."
             )
         else:
@@ -1338,6 +1358,70 @@ class ScriptVoiceTab(ttk.Frame):
             save_config(self.cfg)
             self._refresh_history()
 
+    # ======================================================= cài VieNeu ==
+    def _refresh_install_state(self):
+        """Cập nhật dòng trạng thái + nhãn nút theo việc đã cài VieNeu hay chưa."""
+        if self._installing:
+            return
+        if vinst.is_installed():
+            ver = vinst.installed_version()
+            self.install_status_var.set(f"✓ Đã cài{' ' + ver if ver else ''}")
+            self.install_btn.configure(text="⟳ Nâng cấp")
+        else:
+            if vinst.python_ok() or getattr(sys, "frozen", False):
+                self.install_status_var.set("Chưa cài")
+            else:
+                self.install_status_var.set(
+                    f"Chưa cài — cần Python {vinst.MIN_PYTHON[0]}.{vinst.MIN_PYTHON[1]}+"
+                )
+            self.install_btn.configure(text="⬇ Cài VieNeu")
+        self.install_btn.state(["!disabled"])
+
+    def on_install_vieneu(self):
+        if self._installing:
+            return
+        upgrade = vinst.is_installed()
+        if not upgrade:
+            if not messagebox.askyesno(
+                APP_TITLE,
+                "Cài thư viện VieNeu-TTS bằng pip?\n\n"
+                "• Cần Internet, dung lượng tải có thể vài trăm MB và mất vài phút.\n"
+                "• Lần đọc giọng đầu tiên sẽ tải thêm model nên hơi lâu.\n"
+                "• Trong lúc cài, giao diện vẫn dùng bình thường.",
+                parent=self,
+            ):
+                return
+        self._installing = True
+        self.install_btn.state(["disabled"])
+        self.install_status_var.set("Đang cài...")
+        self.status_var.set("Đang cài VieNeu... (bạn vẫn có thể làm việc khác)")
+        vinst.install_vieneu_in_background(
+            on_progress=lambda m: self._install_queue.put(("progress", m)),
+            on_done=lambda ok, m: self._install_queue.put(("done", (ok, m))),
+            upgrade=upgrade,
+        )
+
+    def _drain_install(self):
+        try:
+            while True:
+                kind, payload = self._install_queue.get_nowait()
+                if kind == "progress":
+                    self.install_status_var.set("Đang cài...")
+                    self.status_var.set(f"Cài VieNeu: {payload}")
+                elif kind == "done":
+                    ok, msg = payload
+                    self._installing = False
+                    self._refresh_install_state()
+                    self.status_var.set(msg)
+                    if ok:
+                        log.info("Cài VieNeu: %s", msg)
+                        messagebox.showinfo(APP_TITLE, msg, parent=self)
+                    else:
+                        log.error("Cài VieNeu thất bại: %s", msg)
+                        messagebox.showerror(APP_TITLE, msg, parent=self)
+        except queue.Empty:
+            pass
+
     # ===================================================== điều phối job ==
     def _begin_job(self, status: str):
         """Bắt đầu 1 việc nền: khoá nút, bật thanh tiến độ. Trả (job_id, stop_fn)."""
@@ -1373,6 +1457,7 @@ class ScriptVoiceTab(ttk.Frame):
 
     def _poll_queue(self):
         self._drain_durations()
+        self._drain_install()
         try:
             while True:
                 job, kind, payload = self.task_queue.get_nowait()
@@ -1423,7 +1508,13 @@ class ScriptVoiceTab(ttk.Frame):
                     else:
                         log.error("Lỗi %s: %s", what, exc)
                         self.status_var.set(f"Lỗi khi {what}: {exc}")
-                        messagebox.showerror(APP_TITLE, f"Lỗi khi {what}:\n{exc}", parent=self)
+                        if "Chưa cài VieNeu" in str(exc) and not self._installing:
+                            if messagebox.askyesno(
+                                APP_TITLE, "Chưa cài VieNeu-TTS. Cài ngay bây giờ?", parent=self,
+                            ):
+                                self.on_install_vieneu()
+                        else:
+                            messagebox.showerror(APP_TITLE, f"Lỗi khi {what}:\n{exc}", parent=self)
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)

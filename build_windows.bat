@@ -5,62 +5,80 @@ cd /d "%~dp0"
 
 set "APP_NAME=DouyinVideoManager"
 set "ICON=assets\app_icon.ico"
+set "VENV=.venv-build311"
 
 echo ============================================
-echo  Build %APP_NAME% (Windows .exe + icon)
+echo  Build %APP_NAME% (Windows .exe, Python 3.11)
 echo ============================================
+echo Goi y: dat BUNDLE_VIENEU=1 truoc khi chay de dong goi san VieNeu vao exe
+echo        (file se rat nang). Mac dinh KHONG dong goi: nguoi dung bam
+echo        "Cai VieNeu" trong app, app se cai bang Python 3.11 tren may.
 
-rem --- Tim Python: uu tien "py" launcher, sau do "python" ---
-set "PY="
-where py >nul 2>nul && set "PY=py -3"
-if not defined PY (
-    where python >nul 2>nul && set "PY=python"
-)
-if not defined PY (
-    echo [LOI] Khong tim thay Python. Hay cai Python 3.9+ va tick "Add Python to PATH".
+rem --- Bat buoc Python 3.11 qua "py" launcher ---
+where py >nul 2>nul
+if errorlevel 1 (
+    echo [LOI] Khong tim thay "py" launcher. Cai Python 3.11 tu https://www.python.org/downloads/
+    echo       va tick "py launcher" + "tcl/tk and IDLE" khi cai.
     goto :fail
 )
-echo Dung Python: %PY%
+py -3.11 --version >nul 2>nul
+if errorlevel 1 (
+    echo [LOI] Chua cai Python 3.11. Cai tai https://www.python.org/downloads/release/python-3119/
+    echo       roi chay lai file nay. Cac phien ban da cai tren may:
+    py -0
+    goto :fail
+)
+for /f "delims=" %%v in ('py -3.11 --version') do echo Dung %%v
+py -3.11 -c "import tkinter" >nul 2>nul
+if errorlevel 1 (
+    echo [LOI] Python 3.11 nay thieu tkinter. Cai lai bang bo cai python.org
+    echo       va tick "tcl/tk and IDLE".
+    goto :fail
+)
 
-rem --- Cai thu vien can thiet ---
+rem --- Moi truong ao rieng de khong dung vao Python khac tren may ---
 echo.
-echo [1/4] Cai dat thu vien...
-%PY% -m pip install --upgrade pip
-%PY% -m pip install -r requirements.txt
+echo [1/5] Tao moi truong ao %VENV% ...
+if not exist "%VENV%\Scripts\python.exe" (
+    py -3.11 -m venv "%VENV%"
+    if errorlevel 1 goto :fail
+)
+set "PY=%VENV%\Scripts\python.exe"
+
+echo.
+echo [2/5] Cai dat thu vien...
+"%PY%" -m pip install --upgrade pip
+"%PY%" -m pip install --prefer-binary -r requirements.txt
 if errorlevel 1 goto :fail
+set "VIENEU_ARGS="
+if "%BUNDLE_VIENEU%"=="1" (
+    echo Dong goi kem VieNeu...
+    "%PY%" -m pip install --prefer-binary vieneu
+    if errorlevel 1 goto :fail
+    set "VIENEU_ARGS=--hidden-import vieneu --collect-all vieneu"
+)
 
-rem --- Icon: neu chua co assets\app_icon.ico thi tu tao bang make_icon.py ---
-rem Muon dung icon rieng: chep file .ico cua ban de len assets\app_icon.ico
 echo.
-echo [2/4] Kiem tra icon...
+echo [3/5] Kiem tra icon...
 if not exist "%ICON%" (
     echo Chua co %ICON%, dang tao icon mac dinh...
-    %PY% make_icon.py
+    "%PY%" make_icon.py
     if errorlevel 1 goto :fail
 )
 if not exist "%ICON%" (
     echo [LOI] Khong tao duoc icon: %ICON%
     goto :fail
 )
-echo Icon: %ICON%
 
-rem --- Don ban build cu ---
 echo.
-echo [3/4] Don dep ban build cu...
+echo [4/5] Don dep ban build cu...
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 if exist "%APP_NAME%.spec" del /q "%APP_NAME%.spec"
 
-rem --- Build ---
-rem --onefile   : gop tat ca vao 1 file .exe duy nhat
-rem --windowed  : khong hien cua so console den
-rem --icon      : icon cua file .exe (hien trong Explorer / taskbar khi ghim)
-rem --add-data  : dong goi thu muc assets vao exe de cua so app cung dung icon
-rem yt_dlp / curl_cffi: thu vien TikTok (import tre) - PyInstaller tu gom day du extractor
-rem openpyxl / PIL duoc import "luoi" (trong ham) nen can khai bao hidden-import
 echo.
-echo [4/4] Dang build, vui long doi...
-%PY% -m PyInstaller --noconfirm --clean --onefile --windowed ^
+echo [5/5] Dang build, vui long doi...
+"%PY%" -m PyInstaller --noconfirm --clean --onefile --windowed ^
     --name "%APP_NAME%" ^
     --icon "%ICON%" ^
     --add-data "assets;assets" ^
@@ -71,18 +89,19 @@ echo [4/4] Dang build, vui long doi...
     --hidden-import curl_cffi ^
     --hidden-import playwright ^
     --collect-all playwright ^
+    %VIENEU_ARGS% ^
     main.py
 if errorlevel 1 goto :fail
 
 echo.
 echo ============================================
-echo  BUILD THANH CONG
+echo  BUILD THANH CONG (Python 3.11)
 echo  File chay: %~dp0dist\%APP_NAME%.exe
 echo ============================================
-echo Luu y 1: tinh nang ghep audio can ffmpeg + ffprobe (cai vao PATH
-echo hoac chon duong dan trong phan Cai dat cua app).
-echo Luu y 2: neu Explorer van hien icon cu, xoa cache icon hoac doi ten
-echo file .exe / khoi dong lai Explorer de cap nhat.
+echo Luu y 1: ghep audio can ffmpeg + ffprobe (PATH hoac chon trong Cai dat).
+echo Luu y 2: de dung VieNeu tren may khac, may do can Python 3.10+ (bam "Cai VieNeu"
+echo          trong app) - hoac build voi BUNDLE_VIENEU=1.
+echo Luu y 3: neu Explorer van hien icon cu, khoi dong lai Explorer.
 if not defined CI (
     explorer "%~dp0dist"
     pause

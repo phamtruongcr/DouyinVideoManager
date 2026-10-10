@@ -20,4 +20,5 @@ playwright>=1.45.0
 
 # Tùy chọn: đọc giọng chạy ngay trên máy (tab "Kịch bản & Giọng đọc", backend VieNeu-TTS).
 # Cần Python >= 3.10; không cài thì dùng backend Gemini TTS.
+# Không cần gõ lệnh: trong app bấm nút "Cài VieNeu" (tab "Kịch bản & Giọng đọc") để cài tự động.
 # vieneu

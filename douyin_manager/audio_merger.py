@@ -54,10 +54,16 @@ class MergeError(RuntimeError):
 # Dò tìm ffmpeg / ffprobe
 # ============================================================================
 
+def _bundled_ffmpeg_dirs() -> list:
+    """Thư mục ffmpeg đi kèm app (bộ cài đặt ffmpeg ở `<thư mục app>\\ffmpeg`)."""
+    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
+    return [base / "ffmpeg", base]
+
+
 def find_ffmpeg(custom_path: str = "") -> Optional[str]:
     """Tìm đường dẫn thực thi ffmpeg: ưu tiên `custom_path` (chấp nhận trỏ
     thẳng tới ffmpeg.exe HOẶC trỏ tới thư mục chứa nó), sau đó tìm trong
-    PATH hệ thống. Trả về None nếu không tìm thấy."""
+    thư mục ffmpeg đi kèm app, rồi PATH hệ thống. Trả về None nếu không tìm thấy."""
     custom_path = (custom_path or "").strip()
     if custom_path:
         p = Path(custom_path)
@@ -68,6 +74,11 @@ def find_ffmpeg(custom_path: str = "") -> Optional[str]:
                 candidate = p / name
                 if candidate.is_file():
                     return str(candidate)
+    for d in _bundled_ffmpeg_dirs():           # ffmpeg đi kèm bộ cài, không cần sửa PATH
+        for name in ("ffmpeg.exe", "ffmpeg"):
+            candidate = d / name
+            if candidate.is_file():
+                return str(candidate)
     return shutil.which("ffmpeg")
 
 
