@@ -1,0 +1,42 @@
+# --- macOS / Windows / editor ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- Môi trường ảo ---
+.venv/
+.venv-build/
+venv/
+env/
+
+# --- Build PyInstaller ---
+build/
+dist/
+*.spec
+
+# --- Dữ liệu cá nhân / bí mật: KHÔNG commit ---
+# (app lưu cookie + API key ở thư mục home, nhưng phòng khi copy vào repo)
+.douyin_video_manager.json
+.douyin_video_manager_history.db
+*.db
+cookies.txt
+*.cookies
+.env
+
+# --- Video / audio tải về hoặc xuất ra khi thử ---
+*.mp4
+*.mkv
+*.mov
+*.mp3
+*.m4a

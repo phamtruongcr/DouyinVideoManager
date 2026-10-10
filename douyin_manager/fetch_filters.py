@@ -100,6 +100,9 @@ class FetchFilters:
     min_views: int = 0
     min_likes: int = 0
     max_items: int = 0          # 0 = không giới hạn
+    # True = giữ nguyên thứ tự nguồn trả về (mới -> cũ), KHÔNG sắp xếp lại theo ngày.
+    # Dùng cho Facebook: nền tảng không trả ngày/view/tym nên không thể sắp/lọc theo đó.
+    keep_source_order: bool = False
 
     def __post_init__(self):
         self.ts_from: Optional[int] = (
@@ -176,6 +179,8 @@ class ItemCollector:
     def _target_count(self) -> int:
         """Số video khớp cần thu thập trước khi dừng quét (0 = không dừng theo số)."""
         f = self.filters
+        if f.keep_source_order:
+            return f.max_items   # thứ tự nguồn: đủ số lượng là dừng, không cần dư cho video ghim
         if not f.max_items or not f.newest_first:
             return 0   # cũ -> mới: phải quét hết vùng cần mới biết video nào cũ nhất
         return f.max_items + PIN_MARGIN
@@ -283,11 +288,14 @@ class ItemCollector:
     def result(self) -> list[dict]:
         """Danh sách cuối: sắp theo ngày đăng đúng thứ tự yêu cầu, cắt theo số tối đa."""
         f = self.filters
-        out = sorted(
-            self.items,
-            key=lambda it: _to_int_or_none(it.get("create_time")) or 0,
-            reverse=f.newest_first,
-        )
+        if f.keep_source_order:
+            out = list(self.items)
+        else:
+            out = sorted(
+                self.items,
+                key=lambda it: _to_int_or_none(it.get("create_time")) or 0,
+                reverse=f.newest_first,
+            )
         if f.max_items:
             out = out[: f.max_items]
         return out

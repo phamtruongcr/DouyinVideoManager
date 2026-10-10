@@ -69,6 +69,8 @@ echo [4/4] Dang build, vui long doi...
     --hidden-import PIL.ImageFont ^
     --hidden-import yt_dlp ^
     --hidden-import curl_cffi ^
+    --hidden-import playwright ^
+    --collect-all playwright ^
     main.py
 if errorlevel 1 goto :fail
 

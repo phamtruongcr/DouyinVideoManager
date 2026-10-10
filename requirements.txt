@@ -12,3 +12,8 @@ Pillow>=10.0.0
 # của TikTok). Extra curl-cffi giúp vượt cơ chế chặn bot khi lấy trang kênh.
 # Nếu TikTok đổi cách chặn: pip install -U yt-dlp
 yt-dlp[default,curl-cffi]>=2025.1.1
+
+# Lấy danh sách video TikTok/Facebook bằng trình duyệt ẩn + bắt JSON API nội bộ khi cuộn trang.
+# Dùng Chrome/Edge có sẵn trên máy; nếu không có sẽ tự tải Chromium lần đầu.
+# (Không có Playwright thì app tự dùng yt-dlp như trước.)
+playwright>=1.45.0

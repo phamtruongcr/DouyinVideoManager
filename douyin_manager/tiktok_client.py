@@ -15,14 +15,18 @@ Nếu TikTok đổi cách chặn bot khiến lấy danh sách lỗi: cập nhậ
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 from .douyin_client import DownloadCancelled
+from .browser_sniffer import SnifferBlocked, SnifferUnavailable, sniff_profile_videos
 from .fetch_filters import FetchFilters, ItemCollector, _to_int_or_none
 
 
@@ -150,8 +154,10 @@ def _entry_to_item(entry: dict) -> Optional[dict]:
 
 
 class TikTokClient:
-    def __init__(self, cookie: str = ""):
+    def __init__(self, cookie: str = "", use_playwright: bool = True):
         self.cookie = cookie.strip()
+        # Playwright (trình duyệt ẩn + bắt JSON API) là cách lấy danh sách chính; yt-dlp là dự phòng
+        self.use_playwright = use_playwright
         # Cảnh báo (không chí mạng) của lần lấy danh sách gần nhất, để GUI hiển thị
         self.last_warning: str = ""
 
@@ -219,6 +225,38 @@ class TikTokClient:
         max_items: int = 0,
         collector: Optional[ItemCollector] = None,
     ) -> list[dict]:
+        """Lấy video của kênh. Ưu tiên Playwright (bắt JSON API nội bộ khi cuộn
+        trang - không phụ thuộc HTML); nếu Playwright không dùng được / không bắt
+        được gì thì tự lùi về yt-dlp."""
+        if collector is None:
+            collector = ItemCollector(FetchFilters(max_items=max_items), stop_flag=stop_flag)
+        self.last_warning = ""
+        if self.use_playwright:
+            try:
+                sniff_profile_videos(
+                    "tiktok", profile_url, stop_flag, collector,
+                    cookie=self.cookie, progress_cb=progress_cb,
+                )
+                return collector.result()
+            except (SnifferUnavailable, SnifferBlocked) as exc:
+                if collector.items or stop_flag():
+                    return collector.result()
+                note = f"Playwright không lấy được ({exc}) -> thử lại bằng yt-dlp."
+                result = self._fetch_via_ytdlp(
+                    profile_url, stop_flag, progress_cb, max_items, collector
+                )
+                self.last_warning = (note + " " + self.last_warning).strip()
+                return result
+        return self._fetch_via_ytdlp(profile_url, stop_flag, progress_cb, max_items, collector)
+
+    def _fetch_via_ytdlp(
+        self,
+        profile_url: str,
+        stop_flag: Callable[[], bool],
+        progress_cb: Optional[Callable[[int], None]] = None,
+        max_items: int = 0,
+        collector: Optional[ItemCollector] = None,
+    ) -> list[dict]:
         """Lấy video của kênh `profile_url` (dạng https://www.tiktok.com/@user),
         MỚI NHẤT trước. `max_items` = 0 -> lấy hết. Lấy dần từng video và kiểm
         tra `stop_flag` giữa chừng nên bấm dừng có tác dụng gần như ngay."""
@@ -277,22 +315,89 @@ class TikTokClient:
         return collector.result()
 
     # ----------------------------------------------------------- Tải về --
+    @staticmethod
+    def _is_video_fmt(f: dict) -> bool:
+        """Định dạng có phần HÌNH (không phải chỉ-tiếng)."""
+        vc = (f.get("vcodec") or "").lower()
+        if vc == "none":
+            return False
+        return bool(vc) or bool(f.get("width") or f.get("height"))
+
+    @staticmethod
+    def _codec_rank(f: dict) -> int:
+        vc = (f.get("vcodec") or "").lower()
+        if vc.startswith(("h264", "avc")):
+            return 0           # phát được mọi nơi
+        if vc.startswith(("h265", "hevc", "bytevc1")):
+            return 2           # nhiều máy chỉ nghe tiếng, mất hình
+        return 1
+
+    @staticmethod
+    def _probe_video(ffprobe: Optional[str], path: Path) -> Optional[dict]:
+        """Đọc luồng hình đầu tiên của file. Trả {} nếu file KHÔNG có hình,
+        None nếu không kiểm tra được (thiếu ffprobe / lỗi)."""
+        if not ffprobe:
+            return None
+        try:
+            out = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name,width,height",
+                 "-of", "json", str(path)],
+                capture_output=True, text=True, timeout=60,
+            ).stdout
+            streams = (json.loads(out or "{}").get("streams")) or []
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+        if not streams or not streams[0].get("width"):
+            return {}
+        return streams[0]
+
+    @staticmethod
+    def _transcode_h264(ffmpeg: str, src: Path, dst: Path) -> bool:
+        try:
+            r = subprocess.run(
+                [ffmpeg, "-y", "-v", "error", "-i", str(src),
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                 "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
+                 "-movflags", "+faststart", str(dst)],
+                capture_output=True, timeout=900,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return r.returncode == 0 and dst.exists() and dst.stat().st_size > 0
+
     def download_video(
         self,
         url: str,
         dest_path: Path,
         chunk_cb: Optional[Callable[[int, int], None]] = None,
         stop_flag: Optional[Callable[[], bool]] = None,
+        ffmpeg_location: str = "",
     ):
         """Tải 1 video TikTok (link trang, dạng .../@user/video/<id>) về
         `dest_path`. Cùng quy ước với DouyinClient.download_video: kiểm tra
         `stop_flag` liên tục, hủy giữa chừng thì xóa file dở và raise
-        DownloadCancelled."""
+        DownloadCancelled.
+
+        Video gắn giỏ hàng (TikTok Shop) hay chỉ trả bản HEVC hoặc định dạng lạ
+        -> tải ra file chỉ có tiếng. Vì vậy: liệt kê định dạng, thử lần lượt từng
+        bản CÓ HÌNH (H.264 trước), kiểm tra file bằng ffprobe; nếu chỉ còn HEVC
+        thì chuyển sang H.264 bằng ffmpeg (nếu có)."""
         if stop_flag and stop_flag():
             raise DownloadCancelled("Đã dừng trước khi bắt đầu tải.")
         yt_dlp = _import_ytdlp()
         logger = _CollectLogger()
         cookie_path = self._make_cookie_file()
+        ffmpeg = ffmpeg_location or shutil.which("ffmpeg") or ""
+        if ffmpeg and Path(ffmpeg).is_dir():
+            ffmpeg = next(
+                (str(Path(ffmpeg) / n) for n in ("ffmpeg.exe", "ffmpeg")
+                 if (Path(ffmpeg) / n).is_file()), "",
+            )
+        ffprobe = None
+        if ffmpeg:
+            from .audio_merger import find_ffprobe
+            ffprobe = find_ffprobe(ffmpeg)
 
         def hook(d: dict):
             if stop_flag and stop_flag():
@@ -301,34 +406,119 @@ class TikTokClient:
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                 chunk_cb(int(d.get("downloaded_bytes") or 0), int(total))
 
-        opts = self._base_opts(logger, cookie_path)
-        opts.update(
-            {
-                # %% để dấu % trong đường dẫn không bị hiểu là mẫu đặt tên của yt-dlp
-                "outtmpl": {"default": str(dest_path).replace("%", "%%")},
-                "format": "b[ext=mp4]/b",
-                "noplaylist": True,
-                "overwrites": True,
-                "retries": 3,
-                "progress_hooks": [hook],
-            }
-        )
-
         def cleanup():
             for suffix in (".part", ".ytdl"):
                 dest_path.with_name(dest_path.name + suffix).unlink(missing_ok=True)
 
-        try:
+        def run(fmt: str, out: Path, info_only: bool = False):
+            opts = self._base_opts(logger, cookie_path)
+            opts.update({
+                # %% để dấu % trong đường dẫn không bị hiểu là mẫu đặt tên của yt-dlp
+                "outtmpl": {"default": str(out).replace("%", "%%")},
+                "format": fmt,
+                "format_sort": ["vcodec:h264", "res", "br"],
+                "noplaylist": True,
+                "overwrites": True,
+                "retries": 3,
+                "progress_hooks": [hook],
+            })
+            if ffmpeg:
+                opts["ffmpeg_location"] = ffmpeg
             with yt_dlp.YoutubeDL(opts) as ydl:
+                if info_only:
+                    return ydl.extract_info(url, download=False)
                 ydl.download([url])
+                return None
+
+        tried: list[str] = []
+        try:
+            try:
+                info = run("all", dest_path, info_only=True) or {}
+            except Exception as exc:
+                if isinstance(exc, DownloadCancelled) or (stop_flag and stop_flag()):
+                    raise
+                info = {}
+            formats = [f for f in (info.get("formats") or []) if f.get("format_id")]
+            video_fmts = sorted(
+                (f for f in formats if self._is_video_fmt(f)),
+                key=lambda f: (self._codec_rank(f), -(f.get("height") or 0),
+                               -(f.get("tbr") or 0)),
+            )
+            # Không liệt kê được định dạng -> dùng bộ chọn tổng quát (như trước)
+            candidates = [f["format_id"] for f in video_fmts] or [
+                "b[vcodec!=none][ext=mp4]/b[vcodec!=none]/b"
+            ]
+            hevc_file: Optional[Path] = None
+            ok = False
+            for fmt in candidates[:6]:
+                if stop_flag and stop_flag():
+                    raise DownloadCancelled("Đã dừng theo yêu cầu người dùng giữa chừng.")
+                cleanup()
+                dest_path.unlink(missing_ok=True)
+                try:
+                    run(fmt, dest_path)
+                except Exception as exc:
+                    if isinstance(exc, DownloadCancelled) or (stop_flag and stop_flag()):
+                        raise
+                    tried.append(f"{fmt}: lỗi tải")
+                    continue
+                if not dest_path.exists():
+                    tried.append(f"{fmt}: không có file")
+                    continue
+                probe = self._probe_video(ffprobe, dest_path)
+                if probe is None:            # không kiểm tra được -> tin file đã tải
+                    ok = True
+                    break
+                if not probe:
+                    tried.append(f"{fmt}: file không có hình")
+                    continue
+                codec = (probe.get("codec_name") or "").lower()
+                if codec in ("hevc", "h265") and ffmpeg:
+                    # Giữ lại, thử bản khác trước; hết bản khác mới chuyển mã
+                    if hevc_file is None:
+                        hevc_file = dest_path.with_name(dest_path.name + ".hevc")
+                        hevc_file.unlink(missing_ok=True)
+                        dest_path.replace(hevc_file)
+                    tried.append(f"{fmt}: HEVC")
+                    continue
+                ok = True
+                break
+
+            if not ok and hevc_file is not None and hevc_file.exists():
+                if self._transcode_h264(ffmpeg, hevc_file, dest_path):
+                    ok = True
+            if not ok:
+                if hevc_file is not None and hevc_file.exists():
+                    hevc_file.replace(dest_path)   # còn hơn không: giữ bản HEVC
+                    ok = True
+                else:
+                    dest_path.unlink(missing_ok=True)
+                    kinds = ", ".join(
+                        f"{f.get('format_id')}({f.get('vcodec') or '?'}/{f.get('acodec') or '?'})"
+                        for f in formats[:8]
+                    ) or "không liệt kê được"
+                    raise TikTokAPIError(
+                        "TikTok không trả bản video CÓ HÌNH cho clip này (thường gặp ở "
+                        "video gắn giỏ hàng) — đã bỏ file chỉ có tiếng.\n"
+                        f"Định dạng nhận được: {kinds}\n"
+                        + ("Đã thử: " + "; ".join(tried) + "\n" if tried else "")
+                        + "Thử: dán Cookie TikTok (đã đăng nhập) ở Cài đặt, hoặc mở lại app để tự cập nhật yt-dlp."
+                    )
         except Exception as exc:
             cleanup()
-            if isinstance(exc, DownloadCancelled) or (stop_flag and stop_flag()):
+            if isinstance(exc, (TikTokAPIError, DownloadCancelled)):
+                if isinstance(exc, DownloadCancelled):
+                    dest_path.unlink(missing_ok=True)
+                raise
+            if stop_flag and stop_flag():
                 raise DownloadCancelled(
                     "Đã dừng theo yêu cầu người dùng giữa chừng."
                 ) from None
             raise TikTokAPIError(_friendly_error(exc)) from exc
         finally:
+            cleanup()
+            if dest_path.with_name(dest_path.name + ".hevc").exists():
+                dest_path.with_name(dest_path.name + ".hevc").unlink(missing_ok=True)
             if cookie_path:
                 try:
                     os.unlink(cookie_path)

@@ -53,6 +53,7 @@ from .audio_merge_gui import AudioMergeTab
 from .douyin_client import DouyinAPIError, DouyinClient, DownloadCancelled
 from .tiktok_client import TikTokAPIError, TikTokClient
 from .facebook_client import FacebookAPIError, FacebookClient
+from .ytdlp_updater import update_ytdlp_in_background
 from .audio_merger import find_ffmpeg
 from .browser_cookies import (
     BROWSERS as COOKIE_BROWSERS, BrowserCookieError, read_cookie_strings, list_profiles,
@@ -95,9 +96,12 @@ class DouyinApp(tk.Tk):
         self.cfg = load_config()
         self.client = DouyinClient(cookie=self.cfg.get("cookie", ""))
         # TikTok dùng yt-dlp; cookie TikTok là TÙY CHỌN (cần cho kênh bị chặn/riêng tư)
-        self.tiktok_client = TikTokClient(cookie=self.cfg.get("tiktok_cookie", ""))
+        # use_playwright (mặc định bật): lấy danh sách bằng trình duyệt ẩn + bắt JSON API,
+        # lỗi thì tự lùi về yt-dlp. Tắt bằng "use_playwright": false trong file config.
+        use_pw = bool(self.cfg.get("use_playwright", True))
+        self.tiktok_client = TikTokClient(cookie=self.cfg.get("tiktok_cookie", ""), use_playwright=use_pw)
         # Facebook cũng dùng yt-dlp; cookie là TÙY CHỌN (cần cho video riêng tư/giới hạn)
-        self.facebook_client = FacebookClient(cookie=self.cfg.get("facebook_cookie", ""))
+        self.facebook_client = FacebookClient(cookie=self.cfg.get("facebook_cookie", ""), use_playwright=use_pw)
         # Tự lấy Cookie từ trình duyệt đang đăng nhập (xem browser_cookies.py)
         self.cookie_browser = self.cfg.get("cookie_browser", "firefox")
         if self.cookie_browser not in COOKIE_BROWSERS:
@@ -192,8 +196,20 @@ class DouyinApp(tk.Tk):
         self._fit_window_height()
         self.after(100, self._poll_queue)
         self.after(150, self._reposition_action_buttons)
+        # Tự cập nhật yt-dlp ở luồng nền mỗi lần mở app (tối đa 12 giờ/lần)
+        self.after(1500, self._update_ytdlp)
 
     # ------------------------------------------------- Cửa sổ / đóng app --
+    def _update_ytdlp(self):
+        """Tự cập nhật yt-dlp bằng pip ở luồng nền lúc mở app (không có nút bấm tay).
+        Chỉ báo ở thanh trạng thái khi có thay đổi hoặc lỗi, tránh làm phiền."""
+
+        def done(ok: bool, msg: str):
+            if not ok or "→" in msg:
+                self.task_queue.put(("status", msg))
+
+        update_ytdlp_in_background(on_done=done, cfg=self.cfg, save_cfg=save_config)
+
     def _apply_initial_geometry(self):
         """Chọn kích thước cửa sổ ban đầu theo kích thước màn hình (đủ lớn để
         thấy hết mọi nút, nhưng không vượt quá màn hình), đặt giữa màn hình."""
@@ -1519,8 +1535,18 @@ class DouyinApp(tk.Tk):
             self._load_single_worker([link])
             return
 
-        self.task_queue.put(("status", f"Đang lấy danh sách video Facebook: {ident}"))
-        collector = self._make_collector(filters, self.facebook_client)
+        # Facebook không trả ngày/view/tym trong danh sách -> BỎ QUA mọi điều kiện lọc
+        # (ngày, view, tym, thứ tự); chỉ lấy theo SỐ LƯỢNG video, từ MỚI -> CŨ.
+        fb_filters = FetchFilters(
+            newest_first=True, max_items=filters.max_items, keep_source_order=True,
+        )
+        ignored = filters.is_active or not filters.newest_first
+        note = (
+            " (bỏ qua điều kiện ngày/view/tym, chỉ lấy theo số lượng, mới → cũ)"
+            if ignored else ""
+        )
+        self.task_queue.put(("status", f"Đang lấy danh sách video Facebook: {ident}{note}"))
+        collector = self._make_collector(fb_filters, self.facebook_client)
         try:
             items = self.facebook_client.fetch_all_user_posts(
                 ident,
@@ -1587,7 +1613,7 @@ class DouyinApp(tk.Tk):
             self.status_var.set(
                 "Không lấy được video nào. Kiểm tra lại link hoặc cập nhật Cookie ở "
                 "mục Cài đặt (Douyin cần Cookie Douyin; TikTok/Facebook có thể cần Cookie "
-                "của trang đó hoặc cập nhật yt-dlp; với Facebook hãy thử dán từng link video)."
+                "của trang đó, hoặc mở lại app để tự cập nhật yt-dlp; với Facebook hãy thử dán từng link video)."
             )
             return
         for item in items:
@@ -2187,7 +2213,7 @@ class DouyinApp(tk.Tk):
             try:
                 dl_client = self._client_for(item.get("platform"))
                 extra = {}
-                if item.get("platform") == "facebook":
+                if item.get("platform") in ("facebook", "tiktok"):
                     # ffmpeg để ghép hình + tiếng chất lượng cao (rỗng = không có)
                     extra["ffmpeg_location"] = find_ffmpeg(
                         self.cfg.get("merge_ffmpeg_path", "")

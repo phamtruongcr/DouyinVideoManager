@@ -55,6 +55,8 @@ python -m PyInstaller --noconfirm --clean --windowed \
     --hidden-import PIL.ImageFont \
     --hidden-import yt_dlp \
     --hidden-import curl_cffi \
+    --hidden-import playwright \
+    --collect-all playwright \
     main.py
 
 # --- Nen thanh .zip de gui cho nguoi khac ---

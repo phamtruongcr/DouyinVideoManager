@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .douyin_client import DownloadCancelled
+from .browser_sniffer import SnifferBlocked, SnifferUnavailable, sniff_profile_videos
 from .fetch_filters import FetchFilters, ItemCollector, _to_int_or_none
 from .tiktok_client import _CollectLogger, _import_ytdlp
 
@@ -125,8 +126,10 @@ def _entry_to_item(entry: dict) -> Optional[dict]:
 
 
 class FacebookClient:
-    def __init__(self, cookie: str = ""):
+    def __init__(self, cookie: str = "", use_playwright: bool = True):
         self.cookie = cookie.strip()
+        # Playwright (trình duyệt ẩn + bắt JSON API) là cách lấy danh sách chính; yt-dlp là dự phòng
+        self.use_playwright = use_playwright
         self.last_warning: str = ""
 
     # ------------------------------------------------------------ nội bộ --
@@ -195,6 +198,38 @@ class FacebookClient:
 
     # -------------------------------------------------- Danh sách video --
     def fetch_all_user_posts(
+        self,
+        profile_url: str,
+        stop_flag: Callable[[], bool],
+        progress_cb: Optional[Callable[[int], None]] = None,
+        max_items: int = 0,
+        collector: Optional[ItemCollector] = None,
+    ) -> list[dict]:
+        """Lấy video của kênh. Ưu tiên Playwright (bắt JSON API nội bộ khi cuộn
+        trang - không phụ thuộc HTML); nếu Playwright không dùng được / không bắt
+        được gì thì tự lùi về yt-dlp."""
+        if collector is None:
+            collector = ItemCollector(FetchFilters(max_items=max_items), stop_flag=stop_flag)
+        self.last_warning = ""
+        if self.use_playwright:
+            try:
+                sniff_profile_videos(
+                    "facebook", profile_url, stop_flag, collector,
+                    cookie=self.cookie, progress_cb=progress_cb,
+                )
+                return collector.result()
+            except (SnifferUnavailable, SnifferBlocked) as exc:
+                if collector.items or stop_flag():
+                    return collector.result()
+                note = f"Playwright không lấy được ({exc}) -> thử lại bằng yt-dlp."
+                result = self._fetch_via_ytdlp(
+                    profile_url, stop_flag, progress_cb, max_items, collector
+                )
+                self.last_warning = (note + " " + self.last_warning).strip()
+                return result
+        return self._fetch_via_ytdlp(profile_url, stop_flag, progress_cb, max_items, collector)
+
+    def _fetch_via_ytdlp(
         self,
         profile_url: str,
         stop_flag: Callable[[], bool],
