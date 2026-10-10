@@ -17,11 +17,16 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from typing import Callable, Optional
 
 import requests
 
-from .config import USER_AGENT, MOBILE_USER_AGENT, REQUEST_TIMEOUT, PAGE_COUNT, REQUEST_DELAY
+from .app_logger import describe_cookie, get_logger
+from .browser_sniffer import SnifferBlocked, SnifferUnavailable, sniff_profile_videos
+from .config import CONFIG_FILE, USER_AGENT, MOBILE_USER_AGENT, REQUEST_TIMEOUT, PAGE_COUNT, REQUEST_DELAY
 from .fetch_filters import FetchFilters, ItemCollector, _to_int_or_none
+
+logger = get_logger("douyin")
 
 
 class DouyinAPIError(Exception):
@@ -122,8 +127,13 @@ def _parse_aweme_list_page(data: dict):
 
 
 class DouyinClient:
-    def __init__(self, cookie: str = ""):
+    def __init__(self, cookie: str = "", use_playwright: bool = True):
         self.cookie = cookie.strip()
+        # Ưu tiên lấy danh sách kênh bằng trình duyệt ẩn (Playwright): trình duyệt tự
+        # tạo chữ ký a_bogus/msToken nên không bị HTTP 403 như gọi API trực tiếp.
+        self.use_playwright = use_playwright
+        # Cảnh báo nhẹ (vd "Playwright lỗi -> đã dùng API trực tiếp") để GUI hiện ở thanh trạng thái
+        self.last_warning: str = ""
 
     def _headers(self, referer: str) -> dict:
         h = {
@@ -182,6 +192,7 @@ class DouyinClient:
         except (requests.RequestException, ValueError) as exc:
             errors.append(f"endpoint detail lỗi: {exc}")
 
+        logger.warning("Không lấy được video %s | %s", aweme_id, "; ".join(errors))
         raise DouyinAPIError(
             "Không lấy được video Douyin này. Có thể video đã bị xóa/riêng tư, là bài "
             "ảnh (không phải video), hoặc cần Cookie Douyin mới trong Cài đặt.\n"
@@ -197,19 +208,31 @@ class DouyinClient:
             f"&publish_video_strategy_type=0&source=channel_pc_web"
         )
         referer = f"https://www.douyin.com/user/{sec_uid}"
+        logger.info("API trực tiếp: GET aweme/post | cursor=%s | cookie=%s",
+                    max_cursor, describe_cookie(self.cookie))
         try:
             resp = requests.get(
                 url, headers=self._headers(referer), timeout=REQUEST_TIMEOUT
             )
         except requests.RequestException as exc:
+            logger.error("API trực tiếp: lỗi kết nối: %s", exc)
             raise DouyinAPIError(f"Lỗi kết nối: {exc}") from exc
 
+        logger.info("API trực tiếp: HTTP %s | %d byte | content-type=%s",
+                    resp.status_code, len(resp.content), resp.headers.get("Content-Type"))
         if resp.status_code != 200:
-            raise DouyinAPIError(f"Douyin trả về mã lỗi HTTP {resp.status_code}.")
+            logger.warning("API trực tiếp bị từ chối: HTTP %s | đầu nội dung: %s",
+                           resp.status_code, resp.text[:300].replace("\n", " "))
+            raise DouyinAPIError(
+                f"Douyin trả về mã lỗi HTTP {resp.status_code} khi gọi API trực tiếp "
+                "(thường do thiếu chữ ký a_bogus/msToken hoặc Cookie hết hạn)."
+            )
 
         try:
             data = resp.json()
         except ValueError as exc:
+            logger.warning("API trực tiếp: không phải JSON | đầu nội dung: %s",
+                           resp.text[:300].replace("\n", " "))
             raise DouyinAPIError(
                 "Không đọc được dữ liệu JSON trả về (có thể bị chặn bot)."
             ) from exc
@@ -217,6 +240,8 @@ class DouyinClient:
         try:
             return _parse_aweme_list_page(data)
         except ValueError as exc:
+            logger.warning("API trực tiếp: JSON thiếu aweme_list | status_code=%s | status_msg=%s",
+                           data.get("status_code"), data.get("status_msg"))
             # Douyin thường trả status_code khác 0 khi cookie thiếu/hết hạn
             raise DouyinAPIError(
                 "Không lấy được danh sách video. Thường do thiếu Cookie hợp lệ "
@@ -225,6 +250,72 @@ class DouyinClient:
             ) from exc
 
     def fetch_all_user_posts(
+        self, sec_uid: str, stop_flag, progress_cb=None, max_items=0, collector=None,
+    ):
+        """Lấy video của kênh. Ưu tiên trình duyệt ẩn (Playwright, tránh HTTP 403); nếu
+        Playwright không dùng được / không bắt được video nào thì lùi về gọi API trực tiếp.
+        Raise DouyinAPIError (kèm lý do của CẢ HAI cách) nếu đều thất bại."""
+        if collector is None:
+            collector = ItemCollector(FetchFilters(max_items=max_items), stop_flag=stop_flag)
+        self.last_warning = ""
+        logger.info("Lấy danh sách kênh | sec_uid=%s... | playwright=%s | cookie=%s",
+                    sec_uid[:14], self.use_playwright, describe_cookie(self.cookie))
+        browser_error = ""
+        if self.use_playwright:
+            profile_url = f"https://www.douyin.com/user/{sec_uid}"
+            state_path = str(CONFIG_FILE.with_name(".douyin_video_manager_pw_state.json"))
+            # Lần 1: trình duyệt ẩn. Nếu bị captcha -> lần 2: mở CỬA SỔ THẬT để người dùng
+            # tự giải captcha (phiên được lưu lại nên các lần sau thường không bị hỏi nữa).
+            for interactive in (False, True):
+                try:
+                    sniff_profile_videos(
+                        "douyin", profile_url, stop_flag, collector,
+                        cookie=self.cookie, progress_cb=progress_cb,
+                        headless=not interactive, interactive=interactive,
+                        state_path=state_path,
+                    )
+                    logger.info("Playwright xong: %d video khớp / %d đã quét",
+                                len(collector.items), collector.scanned)
+                    return collector.result()
+                except SnifferBlocked as exc:
+                    browser_error = str(exc)
+                    logger.warning("Playwright (%s) bị chặn: %s",
+                                   "cửa sổ thật" if interactive else "ẩn", browser_error)
+                    if collector.items or stop_flag():
+                        return collector.result()
+                    if not interactive:
+                        logger.info("Thử lại bằng cửa sổ trình duyệt thật để giải captcha...")
+                        continue
+                    break
+                except SnifferUnavailable as exc:
+                    browser_error = str(exc)
+                    logger.warning("Playwright không lấy được: %s", browser_error)
+                    if collector.items or stop_flag():
+                        return collector.result()
+                    break
+                except Exception as exc:  # noqa: BLE001 - lỗi lạ của Playwright không được làm sập luồng
+                    browser_error = f"lỗi không mong đợi của Playwright: {exc}"
+                    logger.exception("Playwright lỗi không mong đợi")
+                    if collector.items or stop_flag():
+                        return collector.result()
+                    break
+            logger.info("Lùi về gọi API trực tiếp (requests)...")
+        try:
+            result = self._fetch_all_via_api(
+                sec_uid, stop_flag, progress_cb, max_items, collector
+            )
+        except DouyinAPIError as api_exc:
+            if browser_error:
+                raise DouyinAPIError(
+                    f"{api_exc}\n\nTrình duyệt ẩn (Playwright) cũng không lấy được: "
+                    f"{browser_error}\n\nChi tiết xem file log: Cài đặt → 🧾 Nhật ký."
+                ) from api_exc
+            raise
+        if browser_error:
+            self.last_warning = "Playwright không dùng được, đã lấy bằng API trực tiếp."
+        return result
+
+    def _fetch_all_via_api(
         self, sec_uid: str, stop_flag, progress_cb=None, max_items=0, collector=None,
     ):
         """Lặp lấy các trang (video MỚI NHẤT trước) cho tới khi đủ/hết.

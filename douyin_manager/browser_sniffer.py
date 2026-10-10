@@ -7,6 +7,7 @@ duyệt ẩn (headless), tải trang như người dùng thật rồi CUỘN tra
 API nội bộ của nền tảng. Nhờ đó lấy được id/link/ngày/view/tym từ JSON mà
 KHÔNG phải bóc tách HTML (React/Vue đổi giao diện cũng không ảnh hưởng).
 
+  - Douyin  : response của /aweme/v1/web/aweme/post/ (trình duyệt tự tạo chữ ký a_bogus/msToken)
   - TikTok  : response của /api/post/item_list/ (và dữ liệu nhúng trong trang)
   - Facebook: response GraphQL (/api/graphql/) và dữ liệu JSON nhúng trong trang
 
@@ -33,7 +34,10 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Iterable, Iterator, Optional
 
+from .app_logger import get_logger
 from .fetch_filters import ItemCollector, _to_int_or_none
+
+logger = get_logger("sniffer")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -65,11 +69,13 @@ def _walk(node) -> Iterator[dict]:
     stack = [node]
     while stack:
         cur = stack.pop()
+        # Đẩy theo thứ tự ĐẢO để pop() ra đúng thứ tự gốc của JSON (video mới
+        # nhất vẫn đứng trước) — bộ lọc/ItemCollector dựa vào thứ tự này.
         if isinstance(cur, dict):
             yield cur
-            stack.extend(cur.values())
+            stack.extend(reversed(list(cur.values())))
         elif isinstance(cur, list):
-            stack.extend(cur)
+            stack.extend(reversed(cur))
 
 
 def _iso_or_epoch(v) -> int:
@@ -115,6 +121,26 @@ def parse_tiktok_json(data) -> list[dict]:
             "like_count": _to_int_or_none(stats.get("diggCount")),
             "platform": "tiktok",
         })
+    return out
+
+
+def parse_douyin_json(data) -> list[dict]:
+    """Tìm video Douyin trong 1 JSON bất kỳ: lấy mọi danh sách `aweme_list`
+    (đúng cấu trúc endpoint aweme/v1/web/aweme/post/ trả về) theo ĐÚNG thứ tự
+    gốc (mới nhất trước) và đổi từng phần tử bằng cùng hàm mà đường gọi API
+    trực tiếp dùng (`douyin_client._aweme_to_item`), nên item giống hệt nhau."""
+    from .douyin_client import _aweme_to_item  # import muộn: tránh import vòng
+
+    out: list[dict] = []
+    for d in _walk(data):
+        lst = d.get("aweme_list")
+        if not isinstance(lst, list):
+            continue
+        for raw in lst:
+            if isinstance(raw, dict):
+                item = _aweme_to_item(raw)
+                if item:
+                    out.append(item)
     return out
 
 
@@ -226,7 +252,10 @@ def iter_json_chunks(text: str) -> Iterator[object]:
 
 
 def parse_response_text(platform: str, text: str) -> list[dict]:
-    parser = parse_tiktok_json if platform == "tiktok" else parse_facebook_json
+    parser = {
+        "douyin": parse_douyin_json,
+        "tiktok": parse_tiktok_json,
+    }.get(platform, parse_facebook_json)
     items: list[dict] = []
     for obj in iter_json_chunks(text):
         items.extend(parser(obj))
@@ -236,6 +265,7 @@ def parse_response_text(platform: str, text: str) -> list[dict]:
 # URL của response đáng để đọc (lọc sớm cho nhẹ)
 _TIKTOK_API_HINTS = ("/api/post/item_list", "/api/user/detail", "/api/creator/item_list",
                      "/api/repost/item_list", "item_list")
+_DOUYIN_API_HINTS = ("/aweme/v1/web/aweme/post", "/aweme/post")
 _FB_API_HINTS = ("/api/graphql", "graphql", "/ajax/bulk-route-definitions", "/ajax/")
 
 
@@ -246,7 +276,10 @@ def _wanted_response(platform: str, url: str, ctype: str, is_document: bool) -> 
     if "json" not in ctype and "javascript" not in ctype and "text/plain" not in ctype \
             and "text/html" not in ctype:
         return False
-    hints = _TIKTOK_API_HINTS if platform == "tiktok" else _FB_API_HINTS
+    hints = {
+        "douyin": _DOUYIN_API_HINTS,
+        "tiktok": _TIKTOK_API_HINTS,
+    }.get(platform, _FB_API_HINTS)
     return any(h in u for h in hints)
 
 
@@ -283,30 +316,39 @@ def _install_chromium(log: Callable[[str], None]) -> bool:
         return False
 
 
-def _launch_browser(pw, log: Callable[[str], None]):
+def _launch_browser(pw, log: Callable[[str], None], headless: bool = True):
     """Mở trình duyệt headless: Chrome -> Edge -> Chromium của Playwright."""
     args = ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
     last_exc: Optional[Exception] = None
     for channel in ("chrome", "msedge", None):
         try:
-            kw = {"headless": True, "args": args}
+            kw = {"headless": headless, "args": args}
             if channel:
                 kw["channel"] = channel
             return pw.chromium.launch(**kw)
         except Exception as exc:  # noqa: BLE001
+            logger.warning("Không mở được trình duyệt channel=%s: %s", channel or "chromium",
+                           str(exc).splitlines()[0][:200] if str(exc) else exc)
             last_exc = exc
     # Chưa có trình duyệt nào -> thử tự cài Chromium một lần
     msg = str(last_exc).lower() if last_exc else ""
     if "executable doesn't exist" in msg or "playwright install" in msg:
         if _install_chromium(log):
             try:
-                return pw.chromium.launch(headless=True, args=args)
+                return pw.chromium.launch(headless=headless, args=args)
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
     raise SnifferUnavailable(
         "Không mở được trình duyệt cho Playwright (cần Chrome/Edge hoặc chạy "
         "`playwright install chromium`). " + (str(last_exc).splitlines()[0][:200] if last_exc else "")
     )
+
+
+def _safe_title(page) -> str:
+    try:
+        return page.title()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _cookie_list(cookie: str, domain: str) -> list[dict]:
@@ -320,7 +362,40 @@ def _cookie_list(cookie: str, domain: str) -> list[dict]:
     return out
 
 
-_PLATFORM_DOMAIN = {"tiktok": ".tiktok.com", "facebook": ".facebook.com"}
+def _build_user_agent(version: str) -> str:
+    """UA khớp với phiên bản Chrome THẬT đang chạy. Trước đây UA cố định Chrome/126
+    trong khi trình duyệt là 154 -> lệch dấu vân tay, rất dễ bị Douyin đẩy sang captcha."""
+    major = (version or "").split(".")[0]
+    if not major.isdigit():
+        return USER_AGENT
+    if sys.platform == "darwin":
+        plat = "Macintosh; Intel Mac OS X 10_15_7"
+    elif sys.platform.startswith("linux"):
+        plat = "X11; Linux x86_64"
+    else:
+        plat = "Windows NT 10.0; Win64; x64"
+    return (f"Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{major}.0.0.0 Safari/537.36")
+
+
+# Chờ người dùng tự giải captcha (khi mở cửa sổ trình duyệt thật)
+CAPTCHA_WAIT_S = 180
+
+
+def _captcha_now(page) -> bool:
+    url = (page.url or "").lower()
+    title = _safe_title(page)
+    return ("captcha" in url or "verify" in url
+            or any(h in title for h in _CAPTCHA_TEXT_HINTS))
+
+
+_PLATFORM_DOMAIN = {
+    "douyin": ".douyin.com", "tiktok": ".tiktok.com", "facebook": ".facebook.com",
+}
+
+# Dấu hiệu trang đang đòi xác minh (captcha/kéo thanh trượt) — trình duyệt ẩn không tự giải được
+_CAPTCHA_URL_HINTS = ("captcha", "verify", "login")
+_CAPTCHA_TEXT_HINTS = ("验证码中间页", "captcha", "请完成下列验证", "拖动滑块", "Verify to continue")
 
 
 def sniff_profile_videos(
@@ -332,16 +407,30 @@ def sniff_profile_videos(
     progress_cb: Optional[Callable[[int], None]] = None,
     log: Optional[Callable[[str], None]] = None,
     headless: bool = True,
+    interactive: bool = False,
+    state_path: Optional[str] = None,
 ) -> None:
     """Mở `profile_url`, cuộn trang và đẩy từng video bắt được vào `collector`
     (theo thứ tự xuất hiện = mới nhất trước). Dừng khi: collector báo đủ, người
     dùng bấm dừng, hoặc hết video mới.
 
     Raise SnifferUnavailable (không dùng được Playwright) hoặc SnifferBlocked
-    (trang chặn/đòi đăng nhập và không lấy được gì)."""
+    (trang chặn/đòi đăng nhập và không lấy được gì).
+
+    interactive=True (nên đi kèm headless=False): nếu gặp captcha thì ĐỢI tối đa
+    CAPTCHA_WAIT_S giây để người dùng tự kéo thanh trượt trong cửa sổ trình duyệt.
+    state_path: file lưu/nạp cookie + localStorage của phiên Playwright, để lần sau
+    không phải giải captcha lại."""
     if platform not in _PLATFORM_DOMAIN:
         raise SnifferUnavailable(f"Chưa hỗ trợ nền tảng: {platform}")
-    log = log or (lambda _m: None)
+    user_log = log or (lambda _m: None)
+
+    def log(msg: str):   # noqa: F811 - ghi cả ra file log lẫn callback (nếu có)
+        logger.info(msg)
+        user_log(msg)
+
+    logger.info("Sniff bắt đầu | nền tảng=%s | headless=%s | url=%s | cookie=%s",
+                platform, headless, profile_url, "có" if cookie else "KHÔNG")
     sync_playwright, PWError = _import_playwright()
 
     pending: list = []          # response chờ xử lý (xử lý ở luồng chính, tránh gọi API trong handler)
@@ -351,26 +440,33 @@ def sniff_profile_videos(
     def on_response(resp):
         pending.append(resp)
 
+    ctx = None
     with sync_playwright() as pw:
-        browser = _launch_browser(pw, log)
+        browser = _launch_browser(pw, log, headless=headless)
         try:
-            ctx = browser.new_context(
-                user_agent=USER_AGENT, locale="en-US",
-                viewport={"width": 1366, "height": 900},
-            )
+            logger.info("Đã mở trình duyệt, phiên bản: %s", getattr(browser, "version", "?"))
+            ua = _build_user_agent(getattr(browser, "version", ""))
+            ctx_kw = dict(user_agent=ua, locale="zh-CN",
+                          viewport={"width": 1366, "height": 900})
+            if state_path and os.path.exists(state_path):
+                ctx_kw["storage_state"] = state_path
+                logger.info("Nạp phiên Playwright đã lưu: %s", state_path)
+            ctx = browser.new_context(**ctx_kw)
             ctx.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
             )
             if cookie:
                 ctx.add_cookies(_cookie_list(cookie, _PLATFORM_DOMAIN[platform]))
 
-            # Không tải ảnh/video/font -> nhanh và nhẹ (JSON API vẫn đi qua bình thường)
-            def route(r):
-                if r.request.resource_type in ("image", "media", "font"):
-                    r.abort()
-                else:
-                    r.continue_()
-            ctx.route("**/*", route)
+            # Chế độ ẩn: bỏ ảnh/video/font cho nhẹ. Chế độ tương tác (người dùng giải captcha):
+            # KHÔNG chặn gì cả — ảnh ghép hình của captcha cũng là "image", chặn sẽ gây lỗi [5202].
+            if not interactive:
+                def route(r):
+                    if r.request.resource_type in ("image", "media", "font"):
+                        r.abort()
+                    else:
+                        r.continue_()
+                ctx.route("**/*", route)
 
             page = ctx.new_page()
             page.set_default_timeout(NAV_TIMEOUT_MS)
@@ -389,10 +485,18 @@ def sniff_profile_videos(
                         is_doc = req.resource_type == "document"
                         if not _wanted_response(platform, resp.url, ctype, is_doc):
                             continue
+                        status = resp.status
                         text = resp.text()
                     except Exception:  # noqa: BLE001 - response đã bị hủy/đóng, bỏ qua
                         continue
-                    for item in parse_response_text(platform, text):
+                    parsed = parse_response_text(platform, text)
+                    api_hit = not is_doc
+                    if api_hit or parsed:
+                        logger.info("Bắt response | HTTP %s | %d byte | %d video | %s",
+                                    status, len(text), len(parsed), resp.url[:160])
+                    if api_hit and not parsed:
+                        logger.debug("Nội dung response (đầu): %s", text[:300].replace("\n", " "))
+                    for item in parsed:
                         if item["id"] in seen:
                             continue
                         seen.add(item["id"])
@@ -414,6 +518,25 @@ def sniff_profile_videos(
             if drain() or stop_flag():
                 return
 
+            if interactive and got == 0 and _captcha_now(page):
+                log("Douyin đang hiện captcha — hãy kéo thanh trượt trong cửa sổ trình duyệt "
+                    f"vừa mở (chờ tối đa {CAPTCHA_WAIT_S}s)...")
+                deadline = time.time() + CAPTCHA_WAIT_S
+                while time.time() < deadline and not stop_flag():
+                    page.wait_for_timeout(1500)
+                    if drain():
+                        return
+                    if not _captcha_now(page):
+                        break
+                if got == 0 and not stop_flag() and not _captcha_now(page):
+                    try:
+                        page.reload(wait_until="domcontentloaded")
+                        page.wait_for_timeout(3000)
+                    except PWError:
+                        pass
+                    if drain() or stop_flag():
+                        return
+
             idle = 0
             for _ in range(MAX_SCROLLS):
                 if stop_flag():
@@ -431,8 +554,24 @@ def sniff_profile_videos(
                 if idle >= IDLE_SCROLLS_LIMIT:
                     break
 
+            logger.info("Sniff kết thúc | bắt được %d video | url cuối=%s", got, page.url[:160])
             if got == 0:
                 final_url = page.url.lower()
+                try:
+                    body = (page.content() or "")[:6000]
+                except Exception:  # noqa: BLE001
+                    body = ""
+                logger.warning("Không bắt được video nào | tiêu đề trang=%r | đầu trang: %s",
+                               _safe_title(page), body[:200].replace("\n", " "))
+                if platform == "douyin" and (
+                    any(h in final_url for h in _CAPTCHA_URL_HINTS)
+                    or any(h in body for h in _CAPTCHA_TEXT_HINTS)
+                ):
+                    raise SnifferBlocked(
+                        "Douyin đang yêu cầu xác minh (captcha/kéo thanh trượt) hoặc đăng nhập — "
+                        "trình duyệt ẩn không tự giải được. Hãy mở douyin.com bằng trình duyệt "
+                        "thường, vượt xác minh, rồi lấy lại Cookie (Cài đặt) và thử lại."
+                    )
                 if "login" in final_url or "checkpoint" in final_url:
                     raise SnifferBlocked(
                         "Trang yêu cầu đăng nhập. Hãy dán Cookie (đã đăng nhập) vào mục Cài đặt."
@@ -442,6 +581,11 @@ def sniff_profile_videos(
                     "đang chặn bot)."
                 )
         finally:
+            if state_path and got > 0:
+                try:
+                    ctx.storage_state(path=state_path)
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 browser.close()
             except Exception:  # noqa: BLE001
