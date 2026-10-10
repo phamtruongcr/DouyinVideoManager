@@ -48,8 +48,12 @@ from .config import (
     FETCH_ORDER_NEWEST,
     DEFAULT_FETCH_ORDER,
     DEFAULT_FETCH_MAX_ITEMS,
+    LOG_LEVEL_OPTIONS,
 )
 from .audio_merge_gui import AudioMergeTab
+from .download_history import DownloadHistory, make_key
+from . import app_logger
+from .app_logger import get_logger
 from .douyin_client import DouyinAPIError, DouyinClient, DownloadCancelled
 from .tiktok_client import TikTokAPIError, TikTokClient
 from .facebook_client import FacebookAPIError, FacebookClient
@@ -71,8 +75,14 @@ from .widgets import (
 )
 from . import theme
 
+log = get_logger("gui")
+
 CHECK_ON = "\u2611"   # ☑
 CHECK_OFF = "\u2610"  # ☐
+
+# Trạng thái hiển thị cho video đã có trong lịch sử tải (xem download_history.py)
+STATUS_NOT_DOWNLOADED = "Chưa tải"
+STATUS_IN_HISTORY = "Đã tải trước đó"
 
 
 def _resource_path(rel: str) -> Path:
@@ -94,6 +104,8 @@ class DouyinApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.cfg = load_config()
+        # Lịch sử video đã tải (SQLite) — chống tải trùng giữa các lần chạy
+        self.history = DownloadHistory()
         self.client = DouyinClient(cookie=self.cfg.get("cookie", ""))
         # TikTok dùng yt-dlp; cookie TikTok là TÙY CHỌN (cần cho kênh bị chặn/riêng tư)
         # use_playwright (mặc định bật): lấy danh sách bằng trình duyệt ẩn + bắt JSON API,
@@ -198,6 +210,12 @@ class DouyinApp(tk.Tk):
         self.after(150, self._reposition_action_buttons)
         # Tự cập nhật yt-dlp ở luồng nền mỗi lần mở app (tối đa 12 giờ/lần)
         self.after(1500, self._update_ytdlp)
+
+    def report_callback_exception(self, exc, val, tb):
+        """Lỗi trong callback Tkinter (bấm nút...) — ghi vào file log kèm traceback
+        rồi vẫn giữ hành vi mặc định (in ra terminal)."""
+        log.critical("Lỗi trong callback giao diện", exc_info=(exc, val, tb))
+        super().report_callback_exception(exc, val, tb)
 
     # ------------------------------------------------- Cửa sổ / đóng app --
     def _update_ytdlp(self):
@@ -690,8 +708,12 @@ class DouyinApp(tk.Tk):
         tabs.pack(side="top", fill="both", expand=True, padx=12, pady=(10, 0))
         tab_cookie = ttk.Frame(tabs, padding=(2, 4))
         tab_gemini = ttk.Frame(tabs, padding=(2, 4))
+        tab_history = ttk.Frame(tabs, padding=(2, 4))
+        tab_log = ttk.Frame(tabs, padding=(2, 4))
         tabs.add(tab_cookie, text="🍪  Quản lý Cookie")
         tabs.add(tab_gemini, text="✨  Cấu hình Gemini API")
+        tabs.add(tab_history, text="📜  Lịch sử tải")
+        tabs.add(tab_log, text="🧾  Nhật ký")
 
         def info(parent, tip: str):
             """Biểu tượng ⓘ — rê chuột vào để xem hướng dẫn chi tiết."""
@@ -982,9 +1004,121 @@ class DouyinApp(tk.Tk):
             win.after(200, fetch_models)
 
         # =====================================================================
+        # TAB 3 · LỊCH SỬ TẢI
+        # =====================================================================
+        hist_box = ttk.LabelFrame(tab_history, text=" Video đã tải ", padding=10)
+        hist_box.pack(fill="x")
+        hist_count_var = tk.StringVar()
+        hist_msg_var = tk.StringVar(value="")
+
+        def refresh_history_count():
+            hist_count_var.set(f"Số video đã ghi nhận trong lịch sử: {self.history.count()}")
+            if self.history.last_error:
+                hist_msg_var.set(self.history.last_error)
+
+        def clear_history():
+            if not messagebox.askyesno(
+                APP_TITLE,
+                "Xóa TOÀN BỘ lịch sử tải?\n\nChỉ xóa danh sách ghi nhớ trong app, "
+                "các file video đã tải trên máy KHÔNG bị xóa.",
+                parent=win,
+            ):
+                return
+            if self.history.clear():
+                self._reset_history_statuses()
+                hist_msg_var.set("Đã xóa lịch sử tải.")
+            else:
+                hist_msg_var.set(self.history.last_error)
+            refresh_history_count()
+
+        ttk.Label(hist_box, textvariable=hist_count_var).pack(anchor="w")
+        ttk.Label(
+            hist_box, wraplength=640, justify="left",
+            text=(
+                "Mỗi video tải thành công được ghi nhớ (theo nền tảng + ID). Khi lấy lại danh sách "
+                "của cùng kênh, video đã tải sẽ hiện \"Đã tải trước đó\", và khi bấm \"Tải video "
+                "đã chọn\" app sẽ hỏi có bỏ qua chúng không.\n"
+                f"Lưu tại: {self.history.db_path}"
+            ),
+        ).pack(anchor="w", pady=(6, 10))
+        ttk.Button(hist_box, text="🗑 Xóa toàn bộ lịch sử", command=clear_history).pack(anchor="w")
+        ttk.Label(tab_history, textvariable=hist_msg_var).pack(anchor="w", pady=(8, 0))
+        refresh_history_count()
+
+        # =====================================================================
+        # TAB 4 · NHẬT KÝ (LOG)
+        # =====================================================================
+        log_box = ttk.LabelFrame(tab_log, text=" Nhật ký hoạt động ", padding=10)
+        log_box.pack(fill="x")
+        ttk.Label(
+            log_box, wraplength=680, justify="left",
+            text=(
+                "App ghi lại các bước lấy danh sách, tải video và mọi lỗi vào file log. Cookie, "
+                "token, chữ ký và API key được TỰ ĐỘNG che nên có thể gửi file log cho người khác "
+                "xem lỗi.\n"
+                f"File log: {app_logger.log_file_path()}"
+            ),
+        ).pack(anchor="w", pady=(0, 8))
+
+        level_row = ttk.Frame(log_box)
+        level_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(level_row, text="Mức chi tiết:").pack(side="left")
+        log_level_var = tk.StringVar(value=app_logger.current_level_name())
+        ttk.Combobox(
+            level_row, textvariable=log_level_var, values=LOG_LEVEL_OPTIONS,
+            state="readonly", width=8,
+        ).pack(side="left", padx=(6, 6))
+        info(
+            level_row,
+            "INFO: ghi các bước chính + lỗi (gọn).\nDEBUG: ghi thêm chi tiết từng request/response — "
+            "bật khi cần tìm nguyên nhân lỗi, rồi tái hiện lỗi và gửi file log.",
+        ).pack(side="left")
+
+        log_msg_var = tk.StringVar(value="")
+
+        def do_open_folder():
+            app_logger.log_dir().mkdir(parents=True, exist_ok=True)
+            if not app_logger.open_path(app_logger.log_dir()):
+                log_msg_var.set(f"Không mở được thư mục. Đường dẫn: {app_logger.log_dir()}")
+
+        def do_open_file():
+            app_logger.flush_handler()
+            path = app_logger.log_file_path()
+            if not path.exists() or not app_logger.open_path(path):
+                log_msg_var.set(f"Không mở được file log. Đường dẫn: {path}")
+
+        def do_copy_tail():
+            app_logger.flush_handler()
+            text = app_logger.read_tail(200)
+            if not text:
+                log_msg_var.set("File log đang trống.")
+                return
+            win.clipboard_clear()
+            win.clipboard_append(text)
+            log_msg_var.set("Đã sao chép 200 dòng log cuối vào clipboard — dán vào tin nhắn để gửi.")
+
+        def do_clear_log():
+            if not messagebox.askyesno(APP_TITLE, "Xóa toàn bộ file log?", parent=win):
+                return
+            log_msg_var.set("Đã xóa log." if app_logger.clear_logs() else "Không xóa hết được file log.")
+
+        btns = ttk.Frame(log_box)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="📂 Mở thư mục log", command=do_open_folder).pack(side="left")
+        ttk.Button(btns, text="📄 Mở file log", command=do_open_file).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="📋 Sao chép 200 dòng cuối", command=do_copy_tail).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="🗑 Xóa log", command=do_clear_log).pack(side="left", padx=(8, 0))
+        ttk.Label(tab_log, textvariable=log_msg_var, wraplength=700, justify="left").pack(
+            anchor="w", pady=(8, 0)
+        )
+
+        # =====================================================================
         # ĐÁY: Hủy | Lưu
         # =====================================================================
         def save_and_close():
+            self.cfg["log_level"] = log_level_var.get()
+            app_logger.set_level(log_level_var.get())
+
             self.client.cookie = cookie_entries["douyin"].get().strip()
             self.cfg["cookie"] = self.client.cookie
 
@@ -1021,6 +1155,13 @@ class DouyinApp(tk.Tk):
             bg=theme.ACCENT, hover_bg=theme.ACCENT_HOVER, padx=22, pady=5,
         ).pack(side="right")
         ttk.Button(btn_row, text="Hủy", command=win.destroy).pack(side="right", padx=(0, 8))
+
+    def _reset_history_statuses(self):
+        """Sau khi xóa lịch sử: các hàng đang hiện "Đã tải trước đó" trở về "Chưa tải"."""
+        for vid, text in list(self.statuses.items()):
+            if text == STATUS_IN_HISTORY:
+                self.update_row_status(vid, STATUS_NOT_DOWNLOADED)
+                self.logs.pop(vid, None)
 
     def on_choose_folder(self):
         chosen = filedialog.askdirectory(initialdir=str(self.download_dir))
@@ -1325,6 +1466,7 @@ class DouyinApp(tk.Tk):
         try:
             fn(*args)
         except Exception as exc:  # noqa: BLE001
+            log.exception("Lỗi không mong đợi khi lấy danh sách")
             self.task_queue.put(("error", f"Lỗi không mong đợi khi lấy danh sách: {exc}"))
             self.task_queue.put(("load_done", None))
 
@@ -1451,6 +1593,8 @@ class DouyinApp(tk.Tk):
 
     def _load_worker(self, link: str, filters: FetchFilters):
         platform = detect_platform(link) or "douyin"
+        log.info("Bắt đầu lấy danh sách | nền tảng=%s | link=%s | điều kiện: %s",
+                 platform, link, filters.describe() if filters.is_active else "không")
         self._auto_refresh_cookies(platform)
         if platform == "tiktok":
             self._load_worker_tiktok(link, filters)
@@ -1481,12 +1625,14 @@ class DouyinApp(tk.Tk):
                 collector=collector,
             )
         except DouyinAPIError as exc:
+            log.error("Lấy danh sách Douyin thất bại: %s", str(exc).replace("\n", " | "))
             self.task_queue.put(("error", str(exc)))
             self.task_queue.put(("load_done", None))
             return
 
+        log.info("Lấy danh sách Douyin xong: %d video", len(items))
         self.task_queue.put(("videos_loaded", items))
-        self._post_fetch_summary(collector)
+        self._post_fetch_summary(collector, self.client.last_warning)
         self.task_queue.put(("load_done", None))
 
     def _load_worker_tiktok(self, link: str, filters: FetchFilters):
@@ -1513,6 +1659,7 @@ class DouyinApp(tk.Tk):
                 collector=collector,
             )
         except TikTokAPIError as exc:
+            log.error("Lấy danh sách TikTok thất bại: %s", str(exc).replace("\n", " | "))
             self.task_queue.put(("error", str(exc)))
             self.task_queue.put(("load_done", None))
             return
@@ -1554,6 +1701,7 @@ class DouyinApp(tk.Tk):
                 collector=collector,
             )
         except FacebookAPIError as exc:
+            log.error("Lấy danh sách Facebook thất bại: %s", str(exc).replace("\n", " | "))
             self.task_queue.put(("error", str(exc)))
             self.task_queue.put(("load_done", None))
             return
@@ -1570,6 +1718,7 @@ class DouyinApp(tk.Tk):
                 if kind == "status":
                     self.status_var.set(payload)
                 elif kind == "error":
+                    log.error("Hiện thông báo lỗi cho người dùng: %s", payload.replace("\n", " | "))
                     messagebox.showerror(APP_TITLE, payload)
                 elif kind == "videos_loaded":
                     self._populate_tree(payload)
@@ -1616,13 +1765,31 @@ class DouyinApp(tk.Tk):
                 "của trang đó, hoặc mở lại app để tự cập nhật yt-dlp; với Facebook hãy thử dán từng link video)."
             )
             return
+        # Tra lịch sử MỘT lần cho cả danh sách: video đã tải trước đó được
+        # đánh dấu riêng (và vẫn tick chọn / tải lại được nếu người dùng muốn).
+        past = self.history.get_many(
+            [make_key(it.get("platform"), it["id"]) for it in items]
+        )
+        in_history = 0
         for item in items:
             vid = item["id"]
             self.videos[vid] = item
             self.order.append(vid)
             self.checked[vid] = False
             self.titles[vid] = item["desc"]
-            self.statuses[vid] = "Chưa tải"
+            rec = past.get(make_key(item.get("platform"), vid))
+            if rec:
+                in_history += 1
+                status_text = STATUS_IN_HISTORY
+                note = f"Đã tải trước đó lúc {rec.downloaded_at_text} (tổng {rec.download_count} lần)."
+                if rec.file_path:
+                    note += f"\nFile: {rec.file_path}"
+                    if not rec.file_exists:
+                        note += "\n(File này hiện không còn ở vị trí cũ — có thể đã bị xóa hoặc di chuyển.)"
+                self.logs[vid] = note
+            else:
+                status_text = STATUS_NOT_DOWNLOADED
+            self.statuses[vid] = status_text
             mins, secs = divmod(item["duration_s"], 60)
             duration_str = f"{mins}:{secs:02d}" if item["duration_s"] else "-"
             post_time_str = format_post_time(item.get("create_time", 0))
@@ -1636,7 +1803,7 @@ class DouyinApp(tk.Tk):
                     item["url"],
                     duration_str,
                     post_time_str,
-                    "Chưa tải",
+                    status_text,
                     "",  # cột Tải về: để trống, nút thật sẽ đè lên (xem _create_row_widgets)
                     "",  # cột Log
                     "",  # cột Sửa
@@ -1645,7 +1812,10 @@ class DouyinApp(tk.Tk):
                 ),
             )
             self._create_row_widgets(vid)
-        self.status_var.set(f"Đã tải xong {len(items)} video.")
+        msg = f"Đã tải xong {len(items)} video."
+        if in_history:
+            msg += f" ({in_history} video đã tải trước đó — xem cột Trạng thái.)"
+        self.status_var.set(msg)
 
     # ----------------------------------------------------------- Checkbox --
     def on_tree_click(self, event):
@@ -2153,6 +2323,33 @@ class DouyinApp(tk.Tk):
             messagebox.showinfo(APP_TITLE, "Chưa tick chọn video nào để tải.")
             return
 
+        # Video đã có trong lịch sử tải: hỏi bỏ qua hay tải lại
+        past = self.history.get_many(
+            [make_key(self.videos[v].get("platform"), v) for v in ids if v in self.videos]
+        )
+        dup_ids = [
+            v for v in ids
+            if v in self.videos and make_key(self.videos[v].get("platform"), v) in past
+        ]
+        if dup_ids:
+            answer = messagebox.askyesnocancel(
+                APP_TITLE,
+                f"{len(dup_ids)}/{len(ids)} video đã chọn đã được tải trước đó.\n\n"
+                "• Có: BỎ QUA các video đã tải, chỉ tải phần còn lại\n"
+                "• Không: tải LẠI tất cả (tạo thêm file mới)\n"
+                "• Hủy: không tải gì cả",
+            )
+            if answer is None:
+                return
+            if answer:
+                dup_set = set(dup_ids)
+                ids = [v for v in ids if v not in dup_set]
+                if not ids:
+                    messagebox.showinfo(
+                        APP_TITLE, "Tất cả video đã chọn đều đã được tải trước đó nên không có gì để tải."
+                    )
+                    return
+
         self.is_busy = True
         self.download_btn.state(["disabled"])
         self._begin_download_session(ids)
@@ -2223,6 +2420,7 @@ class DouyinApp(tk.Tk):
                     stop_flag=self.download_stop_event.is_set, **extra,
                 )
             except DownloadCancelled:
+                log.info("Đã dừng tải giữa chừng | id=%s", vid)
                 # Dừng NGAY GIỮA CHỪNG (không phải đợi tải xong): file
                 # .part dang dở đã được douyin_client tự xóa.
                 self.logs[vid] = (
@@ -2242,6 +2440,9 @@ class DouyinApp(tk.Tk):
                 self.downloading_ids.discard(vid)
                 return
             except (requests.RequestException, OSError, TikTokAPIError, FacebookAPIError) as exc:
+                log.error("Tải thất bại | %s | id=%s | url=%s | %s: %s",
+                          item.get("platform") or "douyin", vid, item.get("url", "")[:140],
+                          type(exc).__name__, exc)
                 self.logs[vid] = f"Lỗi khi tải lúc {time.strftime('%H:%M:%S')}: {exc}"
                 self.task_queue.put(("video_status", (vid, "Lỗi")))
                 with lock:
@@ -2257,6 +2458,13 @@ class DouyinApp(tk.Tk):
                 return
 
             self.logs[vid] = f"Đã tải thành công lúc {time.strftime('%H:%M:%S')}: {dest}"
+            # Ghi vào lịch sử (lỗi ghi chỉ lưu ở history.last_error, không làm hỏng việc tải)
+            log.info("Tải xong | %s | id=%s | %s", item.get("platform") or "douyin", vid, dest)
+            if not self.history.record(
+                item.get("platform"), vid, title=title, original_title=item.get("desc", ""),
+                url=item.get("url", ""), file_path=dest,
+            ):
+                log.warning("Không ghi được lịch sử tải: %s", self.history.last_error)
             self.task_queue.put(("video_status", (vid, "Đã tải")))
             with lock:
                 counters["done"] += 1

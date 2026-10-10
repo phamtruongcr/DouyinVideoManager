@@ -29,7 +29,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .douyin_client import DownloadCancelled
+from .app_logger import get_logger
 from .browser_sniffer import SnifferBlocked, SnifferUnavailable, sniff_profile_videos
+
+logger = get_logger("facebook")
 from .fetch_filters import FetchFilters, ItemCollector, _to_int_or_none
 from .tiktok_client import _CollectLogger, _import_ytdlp
 
@@ -222,6 +225,7 @@ class FacebookClient:
                 if collector.items or stop_flag():
                     return collector.result()
                 note = f"Playwright không lấy được ({exc}) -> thử lại bằng yt-dlp."
+                logger.warning(note)
                 result = self._fetch_via_ytdlp(
                     profile_url, stop_flag, progress_cb, max_items, collector
                 )

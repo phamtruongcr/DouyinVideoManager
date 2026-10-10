@@ -12,6 +12,13 @@ from pathlib import Path
 
 APP_TITLE = "Douyin Video Manager"
 CONFIG_FILE = Path.home() / ".douyin_video_manager.json"
+# Lịch sử video đã tải (SQLite) — xem download_history.py
+HISTORY_DB_FILE = Path.home() / ".douyin_video_manager_history.db"
+# Thư mục + tên file nhật ký (log) — xem app_logger.py
+LOG_DIR = Path.home() / ".douyin_video_manager_logs"
+LOG_FILE_NAME = "app.log"
+LOG_LEVEL_OPTIONS = ["INFO", "DEBUG"]   # INFO = gọn; DEBUG = chi tiết (khi cần tìm lỗi)
+DEFAULT_LOG_LEVEL = "INFO"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

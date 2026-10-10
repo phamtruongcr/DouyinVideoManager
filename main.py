@@ -56,8 +56,18 @@ from douyin_manager.gui import DouyinApp
 
 
 def main():
+    # Bật ghi log ra file TRƯỚC khi mở giao diện để bắt được cả lỗi lúc khởi động
+    from douyin_manager import app_logger
+    from douyin_manager.config import load_config
+
+    cfg = load_config()
+    app_logger.setup_logging(cfg.get("log_level"))
+    app_logger.install_exception_hooks()
+    app_logger.log_startup_info(cfg)
+
     app = DouyinApp()
     app.mainloop()
+    app_logger.get_logger().info("Đóng ứng dụng")
 
 
 if __name__ == "__main__":
