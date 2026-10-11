@@ -266,12 +266,64 @@ _COMMON_RULES = """QUY TẮC BẮT BUỘC:
 _SYSTEM_TEMPLATE = _PLAIN_TEMPLATE.replace("{common_rules}", _COMMON_RULES)
 
 
+# Biến người dùng có thể chèn vào prompt tùy chỉnh: {tên_biến} -> giá trị lúc tạo kịch bản.
+CUSTOM_PROMPT_VARS = {
+    "product": "Tên sản phẩm (ô Sản phẩm)",
+    "target_seconds": "Thời lượng mục tiêu (giây)",
+    "target_words": "Số từ nên viết",
+    "min_words": "Số từ tối thiểu",
+    "max_words": "Số từ tối đa",
+    "address_terms": "Cách xưng hô (ô Xưng hô)",
+    "slang": "Từ khóa review (ô Từ khóa review)",
+}
+_LENGTH_VARS = ("target_words", "min_words", "max_words")
+
+
+def _koc_values(koc: KocBrief) -> dict:
+    secs = koc.target_seconds
+    return {
+        "product": koc.product or "(không ghi rõ — hãy tự nhận biết sản phẩm từ video)",
+        "target_seconds": f"{secs:g}" if isinstance(secs, (int, float)) else str(secs),
+        "target_words": str(koc.target_words),
+        "min_words": str(koc.min_words),
+        "max_words": str(koc.max_words),
+        "address_terms": koc.address_terms or '"Bác nào", "Bà con", "Các chị em"',
+        "slang": koc.slang or "chân ái, nhàn tênh, ngon ơ, chốt ngay, rinh ngay",
+    }
+
+
+def default_custom_prompt() -> str:
+    """Prompt KOC mặc định ở dạng mẫu (còn nguyên {biến}) để người dùng sửa tiếp. Không kèm quy tắc
+    kỹ thuật vì phần đó luôn được tự thêm vào cuối."""
+    return _KOC_TEMPLATE.replace("\n\n{common_rules}", "").strip()
+
+
+def render_custom_prompt(template: str, koc: Optional[KocBrief] = None) -> str:
+    """Thay các {biến} đã biết trong prompt tùy chỉnh. Biến lạ / dấu { } khác giữ nguyên (không lỗi).
+    Luôn thêm quy tắc kỹ thuật (văn bản thuần, số -> chữ...) để lời đọc vẫn đưa được vào TTS; nếu mẫu
+    không nhắc tới số từ thì thêm 1 dòng ràng buộc độ dài (app dựa vào đó để khớp thời lượng)."""
+    template = (template or "").strip()
+    values = _koc_values(koc or KocBrief())
+    text = template
+    for key, val in values.items():
+        text = text.replace("{" + key + "}", val)
+    if not any("{" + k + "}" in template for k in _LENGTH_VARS):
+        text += (
+            f"\n\nĐỘ DÀI: viết khoảng {values['target_words']} từ (trong khoảng "
+            f"{values['min_words']} đến {values['max_words']} từ) để đọc vừa {values['target_seconds']} giây."
+        )
+    return text + "\n\n" + _COMMON_RULES
+
+
 def build_system_instruction(
     max_words: int = DEFAULT_MAX_WORDS, koc: Optional[KocBrief] = None,
+    custom_prompt: str = "",
 ) -> str:
-    """Dựng system instruction. Có `koc` -> prompt KOC/Reviewer (Hook - Thân - Kết, xưng
-    hô, từ khóa, số từ theo thời lượng); không có -> prompt chung. Dùng replace() thay vì
-    format() để các dấu { } khác (nếu có) không gây lỗi."""
+    """Dựng system instruction. Có `custom_prompt` -> dùng prompt người dùng tự soạn; ngược lại có
+    `koc` -> prompt KOC/Reviewer (Hook - Thân - Kết, xưng hô, từ khóa, số từ theo thời lượng);
+    không có -> prompt chung. Dùng replace() thay vì format() để các dấu { } khác (nếu có) không gây lỗi."""
+    if (custom_prompt or "").strip():
+        return render_custom_prompt(custom_prompt, koc)
     try:
         n = max(10, int(max_words))
     except (TypeError, ValueError):
@@ -281,17 +333,7 @@ def build_system_instruction(
         values = {"common_rules": _COMMON_RULES, "max_words": str(n)}
     else:
         text = _KOC_TEMPLATE
-        secs = koc.target_seconds
-        values = {
-            "common_rules": _COMMON_RULES,
-            "product": koc.product or "(không ghi rõ — hãy tự nhận biết sản phẩm từ video)",
-            "target_seconds": f"{secs:g}" if isinstance(secs, (int, float)) else str(secs),
-            "target_words": str(koc.target_words),
-            "min_words": str(koc.min_words),
-            "max_words": str(koc.max_words),
-            "address_terms": koc.address_terms or '"Bác nào", "Bà con", "Các chị em"',
-            "slang": koc.slang or "chân ái, nhàn tênh, ngon ơ, chốt ngay, rinh ngay",
-        }
+        values = {"common_rules": _COMMON_RULES, **_koc_values(koc)}
     for key, val in values.items():
         text = text.replace("{" + key + "}", val)
     return text
@@ -317,16 +359,19 @@ def build_user_prompt(extra_instruction: str = "", koc: Optional[KocBrief] = Non
     return prompt
 
 
-def build_length_feedback(draft_words: int, koc: KocBrief) -> str:
+def build_length_feedback(draft_words: int, koc: KocBrief, custom: bool = False) -> str:
     """Câu yêu cầu viết lại khi bản nháp lệch số từ (gửi kèm bản nháp ở lượt sau)."""
     if draft_words > koc.max_words:
         verdict = f"quá dài ({draft_words} từ)"
     else:
         verdict = f"quá ngắn ({draft_words} từ)"
+    # Prompt tùy chỉnh: không áp cấu trúc KOC (Hook/tính năng/chốt đơn) lên cấu trúc người dùng tự đặt.
+    keep = ("giữ nguyên phong cách và cấu trúc như yêu cầu ban đầu" if custom
+            else "giữ đủ Hook, 2 đến 3 tính năng và lời kêu gọi chốt đơn ở cuối")
     return (
         f"Bản vừa rồi {verdict}. Hãy viết lại cho đúng khoảng {koc.target_words} từ "
         f"(trong {koc.min_words} đến {koc.max_words} từ) để đọc vừa {koc.target_seconds:g} giây, "
-        "giữ đủ Hook, 2 đến 3 tính năng và lời kêu gọi chốt đơn ở cuối. Chỉ trả về lời đọc."
+        f"{keep}. Chỉ trả về lời đọc."
     )
 
 
@@ -642,6 +687,7 @@ def generate_review_script(
     fallback_model: Optional[str] = None,
     extra_instruction: str = "",
     koc: Optional[KocBrief] = None,
+    custom_prompt: str = "",
     stop_flag: Optional[Callable[[], bool]] = None,
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> ReviewScriptResult:
@@ -652,7 +698,10 @@ def generate_review_script(
     Có `koc` -> dùng prompt KOC; số từ tối đa lấy từ `koc.max_words` (bỏ qua `max_words`)
     và nếu bản đầu lệch khỏi khoảng [min_words, max_words] thì NHỜ GEMINI VIẾT LẠI 1 LẦN
     (gửi kèm bản nháp) để khớp thời lượng, thay vì cắt cụt mất đoạn kết kêu gọi chốt đơn.
-    Hết lượt thử vẫn dài quá thì mới cắt theo câu."""
+    Hết lượt thử vẫn dài quá thì mới cắt theo câu.
+
+    `custom_prompt` (không rỗng) thay thế system prompt dựng sẵn; các {biến} trong đó được thay bằng
+    giá trị của `koc` (nên truyền `koc` để có số từ/thời lượng)."""
     if not (api_key or "").strip():
         raise ReviewScriptError("Chưa có Gemini API Key. Vào mục Cài đặt để nhập API Key trước.")
 
@@ -672,7 +721,8 @@ def generate_review_script(
         size_mb = len(data) / 1048576
         del data
 
-    system_text = build_system_instruction(cap, koc)
+    use_custom = bool((custom_prompt or "").strip())
+    system_text = build_system_instruction(cap, koc, custom_prompt)
     contents: list = [{
         "role": "user",
         "parts": [
@@ -683,8 +733,8 @@ def generate_review_script(
 
     if progress_cb:
         progress_cb("Đang nhờ Gemini viết kịch bản review...")
-    logger.info("Viết kịch bản | %s | %.1f MB | tối đa %d từ | KOC=%s | model=%s",
-                video_path.name, size_mb, cap, bool(koc), model or "(mặc định)")
+    logger.info("Viết kịch bản | %s | %.1f MB | tối đa %d từ | KOC=%s | prompt tùy chỉnh=%s | model=%s",
+                video_path.name, size_mb, cap, bool(koc), use_custom, model or "(mặc định)")
 
     attempts = 2 if koc else 1
     best_text, best_raw, best_trunc, best_gap = "", "", False, None
@@ -710,7 +760,7 @@ def generate_review_script(
                 progress_cb(f"Bản nháp {words} từ, lệch mục tiêu ({koc.min_words}-{koc.max_words}) — viết lại...")
             contents = contents + [
                 {"role": "model", "parts": [{"text": full_text}]},
-                {"role": "user", "parts": [{"text": build_length_feedback(words, koc)}]},
+                {"role": "user", "parts": [{"text": build_length_feedback(words, koc, use_custom)}]},
             ]
     del encoded, contents
 

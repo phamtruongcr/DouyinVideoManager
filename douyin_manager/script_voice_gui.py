@@ -44,6 +44,7 @@ from .config import (
     MAX_TTS_PAUSE_SENTENCE,
     MAX_TTS_SPEED,
     MAX_TTS_STABILITY,
+    CUSTOM_PROMPT_MAX_LEN,
     MIN_REVIEW_DURATION,
     MIN_TTS_PAUSE,
     MIN_TTS_SPEED,
@@ -54,6 +55,7 @@ from .config import (
     TTS_BACKEND_VIENEU,
     TTS_HISTORY_MAX,
     VIDEO_EXTENSIONS,
+    read_custom_prompt,
     read_koc_brief,
     read_review_settings,
     read_tts_settings,
@@ -61,8 +63,10 @@ from .config import (
 )
 from .download_history import DownloadHistory
 from .review_script import (
+    CUSTOM_PROMPT_VARS,
     KocBrief,
     count_words,
+    default_custom_prompt,
     estimate_read_seconds,
     blend_words_per_second,
     estimate_target_words,
@@ -82,6 +86,7 @@ from .tts_local import (
     wav_duration_seconds,
     wav_peaks,
 )
+from . import prompt_library as plib
 from . import voice_library as vlib
 from . import vieneu_installer as vinst
 from .audio_bar import AudioBar, format_clock
@@ -328,6 +333,25 @@ class ScriptVoiceTab(ttk.Frame):
         self.address_entry.grid(row=1, column=1, sticky="ew", pady=3)
         lab(col2, 2, "Ghi chú", "Ghi chú / tính năng nổi bật của sản phẩm để đưa vào kịch bản.")
         extra_entry.grid(row=2, column=1, sticky="ew", pady=3)
+
+        # ---- Prompt tùy chỉnh: bật/tắt + nút mở cửa sổ soạn ----
+        cp = read_custom_prompt(self.cfg)
+        self.use_custom_var = tk.BooleanVar(value=cp["use"])
+        self.custom_info_var = tk.StringVar(value="")
+        cp_row = ttk.Frame(form)
+        cp_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        cp_chk = ttk.Checkbutton(
+            cp_row, text="Dùng prompt tùy chỉnh", variable=self.use_custom_var,
+            command=self._on_custom_toggled,
+        )
+        cp_chk.pack(side="left")
+        Tooltip(cp_chk, "Thay prompt dựng sẵn bằng prompt do bạn tự soạn. Có thể chèn {product}, "
+                        "{target_words}, {address_terms}... (xem trong cửa sổ soạn). Quy tắc kỹ thuật "
+                        "(văn bản thuần, số viết thành chữ) vẫn luôn được thêm vào cuối.", wraplength=320)
+        ttk.Button(cp_row, text="✎  Soạn prompt...", style="Secondary.TButton",
+                   command=self._open_prompt_editor).pack(side="left", padx=(10, 0))
+        ttk.Label(cp_row, textvariable=self.custom_info_var, style="Muted.TLabel").pack(side="left", padx=(12, 0))
+        self._update_custom_info()
 
         # ---- Nút tạo kịch bản: ngay dưới form, phía trên khung soạn thảo ----
         gen_row = ttk.Frame(c2)
@@ -615,11 +639,191 @@ class ScriptVoiceTab(ttk.Frame):
         """Sản phẩm / thời lượng / phong cách đổi: lưu, bật-tắt ô KOC, cập nhật số từ mục tiêu."""
         if save:
             self._save_settings()
-        koc_on = REVIEW_STYLE_OPTIONS.get(self.style_var.get()) == REVIEW_STYLE_KOC
+        koc_on = (REVIEW_STYLE_OPTIONS.get(self.style_var.get()) == REVIEW_STYLE_KOC
+                  or bool(self.use_custom_var.get()))     # prompt tùy chỉnh cũng dùng {address_terms}/{slang}
         for e in (self.address_entry, self.slang_entry):
             e.configure(state="normal" if koc_on else "disabled")
         self._update_target_info()
         self._update_words_info()
+
+    # ===================================================== prompt tùy chỉnh ==
+    def _update_custom_info(self):
+        cp = read_custom_prompt(self.cfg)
+        if not self.use_custom_var.get():
+            self.custom_info_var.set("")
+        elif not cp["text"]:
+            self.custom_info_var.set("Chưa có nội dung — đang dùng prompt mặc định")
+        else:
+            saved = plib.find_prompt_by_text(self.cfg, cp["text"])
+            self.custom_info_var.set(f"Đang dùng: {saved['name']}" if saved else "Đang dùng: prompt tự soạn")
+
+    def _on_custom_toggled(self):
+        """Bật mà chưa có nội dung -> mở luôn cửa sổ soạn (điền sẵn prompt mẫu để sửa)."""
+        self._on_brief_changed()
+        if self.use_custom_var.get() and not read_custom_prompt(self.cfg)["text"]:
+            self._open_prompt_editor()
+        self._update_custom_info()
+
+    def _open_prompt_editor(self):
+        """Cửa sổ soạn prompt: chèn biến, chọn/lưu/xóa prompt đã đặt tên, khôi phục mẫu mặc định."""
+        win = tk.Toplevel(self)
+        win.title("Soạn prompt tùy chỉnh")
+        win.geometry("820x600")
+        win.minsize(680, 480)
+        win.transient(self.winfo_toplevel())
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        text_now = read_custom_prompt(self.cfg)["text"] or default_custom_prompt()
+
+        # ---- Đáy: nút hành động (pack trước để luôn hiện đủ) ----
+        bottom = ttk.Frame(win)
+        bottom.pack(side="bottom", fill="x", padx=12, pady=(4, 10))
+        count_var = tk.StringVar(value="")
+        ttk.Label(bottom, textvariable=count_var, style="Muted.TLabel").pack(side="left")
+
+        # ---- Hàng prompt đã lưu ----
+        top = ttk.Frame(win)
+        top.pack(side="top", fill="x", padx=12, pady=(10, 4))
+        ttk.Label(top, text="Prompt đã lưu").pack(side="left")
+        saved_var = tk.StringVar(value="")
+        saved_combo = ttk.Combobox(top, textvariable=saved_var, state="readonly",
+                                   values=plib.prompt_names(self.cfg), width=28)
+        saved_combo.pack(side="left", padx=(8, 4))
+
+        # ---- Hàng chèn biến ----
+        vars_row = ttk.Frame(win)
+        vars_row.pack(side="top", fill="x", padx=12, pady=(2, 4))
+        ttk.Label(vars_row, text="Chèn biến:", style="Muted.TLabel").pack(side="left", padx=(0, 6))
+
+        # ---- Khung soạn ----
+        box = ttk.Frame(win)
+        box.pack(side="top", fill="both", expand=True, padx=12, pady=(2, 4))
+        txt = tk.Text(box, wrap="word", undo=True, padx=10, pady=8)
+        vsb = ttk.Scrollbar(box, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        txt.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+        txt.insert("1.0", text_now)
+        txt.edit_reset()
+
+        def update_count(_e=None):
+            if txt.edit_modified():
+                txt.edit_modified(False)
+            n = len(txt.get("1.0", "end").strip())
+            count_var.set(f"{n:,}/{CUSTOM_PROMPT_MAX_LEN:,} ký tự")
+
+        txt.bind("<<Modified>>", update_count)
+        update_count()
+
+        def insert_var(name: str):
+            txt.insert("insert", "{" + name + "}")
+            txt.focus_set()
+
+        for name, desc in CUSTOM_PROMPT_VARS.items():
+            b = ttk.Button(vars_row, text="{" + name + "}", style="Icon.TButton",
+                           command=lambda n=name: insert_var(n))
+            b.pack(side="left", padx=2)
+            Tooltip(b, desc)
+
+        def current_text() -> str:
+            return txt.get("1.0", "end").strip()
+
+        def sync_saved():
+            saved_combo.configure(values=plib.prompt_names(self.cfg))
+            hit = plib.find_prompt_by_text(self.cfg, current_text())
+            saved_var.set(hit["name"] if hit else "")
+
+        def on_pick(_e=None):
+            p = plib.find_prompt(self.cfg, saved_var.get())
+            if p:
+                txt.delete("1.0", "end")
+                txt.insert("1.0", p["text"])
+                update_count()
+
+        saved_combo.bind("<<ComboboxSelected>>", on_pick)
+
+        def on_save():
+            body = current_text()
+            if not body:
+                messagebox.showinfo(APP_TITLE, "Prompt đang trống, chưa có gì để lưu.", parent=win)
+                return
+            cur = plib.find_prompt_by_text(self.cfg, body)
+            name = simpledialog.askstring(
+                APP_TITLE, "Đặt tên cho prompt này (trùng tên sẽ thay prompt cũ):",
+                initialvalue=saved_var.get() or (cur["name"] if cur else ""), parent=win,
+            )
+            if name is None:
+                return
+            existing = plib.find_prompt(self.cfg, name)
+            if existing and existing["text"] != body and not messagebox.askyesno(
+                APP_TITLE, f"Đã có prompt \"{existing['name']}\". Thay bằng nội dung này?", parent=win
+            ):
+                return
+            try:
+                entry = plib.save_prompt(self.cfg, name, body)
+            except plib.PromptLibraryError as exc:
+                messagebox.showerror(APP_TITLE, str(exc), parent=win)
+                return
+            save_config(self.cfg)
+            sync_saved()
+            saved_var.set(entry["name"])
+
+        def on_delete():
+            name = saved_var.get().strip()
+            if not name:
+                messagebox.showinfo(APP_TITLE, "Hãy chọn một prompt trong ô \"Prompt đã lưu\" để xóa.", parent=win)
+                return
+            if not messagebox.askyesno(APP_TITLE, f"Xóa prompt \"{name}\"?", parent=win):
+                return
+            plib.delete_prompt(self.cfg, name)
+            save_config(self.cfg)
+            sync_saved()
+
+        def on_reset():
+            if current_text() and current_text() != default_custom_prompt() and not messagebox.askyesno(
+                APP_TITLE, "Thay nội dung đang soạn bằng prompt mẫu mặc định?", parent=win
+            ):
+                return
+            txt.delete("1.0", "end")
+            txt.insert("1.0", default_custom_prompt())
+            update_count()
+            sync_saved()
+
+        def on_apply():
+            body = current_text()
+            if len(body) > CUSTOM_PROMPT_MAX_LEN:
+                messagebox.showerror(APP_TITLE, f"Prompt quá dài (tối đa {CUSTOM_PROMPT_MAX_LEN:,} ký tự).", parent=win)
+                return
+            self.cfg["review_custom_prompt"] = body
+            self.use_custom_var.set(bool(body))
+            self._save_settings()
+            self._on_brief_changed(save=False)
+            self._update_custom_info()
+            self.status_var.set("Đã áp dụng prompt tùy chỉnh." if body else "Prompt trống — dùng prompt mặc định.")
+            win.destroy()
+
+        def on_cancel():
+            # Hủy khi vừa bật mà chưa có nội dung nào -> tắt lại để khỏi bật "rỗng".
+            if not read_custom_prompt(self.cfg)["text"]:
+                self.use_custom_var.set(False)
+                self._save_settings()
+                self._on_brief_changed(save=False)
+                self._update_custom_info()
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_cancel)
+        save_btn = ttk.Button(top, text="💾", style="Icon.TButton", width=3, command=on_save)
+        save_btn.pack(side="left", padx=2)
+        del_btn = ttk.Button(top, text="🗑", style="Icon.TButton", width=3, command=on_delete)
+        del_btn.pack(side="left", padx=2)
+        Tooltip(save_btn, "Lưu prompt đang soạn với một cái tên")
+        Tooltip(del_btn, "Xóa prompt đã lưu đang chọn")
+        ttk.Button(bottom, text="Áp dụng", style="Secondary.TButton", command=on_apply).pack(side="right")
+        ttk.Button(bottom, text="Hủy", style="Secondary.TButton", command=on_cancel).pack(side="right", padx=(0, 6))
+        ttk.Button(bottom, text="↺ Mẫu mặc định", style="Secondary.TButton", command=on_reset).pack(side="right", padx=(0, 6))
+        sync_saved()
+        win.grab_set()
+        txt.focus_set()
 
     # ======================================================== cấu hình ==
     def _backend_kind(self) -> str:
@@ -777,6 +981,7 @@ class ScriptVoiceTab(ttk.Frame):
         self.cfg["review_address_terms"] = self.address_var.get().strip()
         self.cfg["review_slang"] = self.slang_var.get().strip()
         self.cfg["review_extra"] = self.extra_var.get().strip()
+        self.cfg["review_use_custom_prompt"] = bool(self.use_custom_var.get())
         self.cfg["tts_stability"] = round(float(self.stability_var.get()), 1)
         self.cfg["tts_speed"] = round(float(self.speed_var.get()), 2)
         self.cfg["tts_autofit"] = bool(self.autofit_var.get())
@@ -1042,8 +1247,10 @@ class ScriptVoiceTab(ttk.Frame):
 
         settings = read_review_settings(self.cfg)
         brief = read_koc_brief(self.cfg)
-        use_koc = settings["style"] == REVIEW_STYLE_KOC
-        # KOC: hướng dẫn phong cách đã nằm trong system instruction -> chỉ gửi ghi chú của người dùng.
+        custom = read_custom_prompt(self.cfg)
+        # Prompt tùy chỉnh cần KocBrief để thay {biến} và ép số từ theo thời lượng (dù phong cách đang chọn là gì).
+        use_koc = settings["style"] == REVIEW_STYLE_KOC or custom["enabled"]
+        # KOC / prompt tùy chỉnh: hướng dẫn đã nằm trong system instruction -> chỉ gửi ghi chú của người dùng.
         extra = "\n".join(
             x for x in (None if use_koc else settings["style_hint"], self.cfg.get("review_extra", "")) if x
         )
@@ -1072,7 +1279,8 @@ class ScriptVoiceTab(ttk.Frame):
                 res = generate_review_script(
                     video, api_key, ffmpeg_path=ffmpeg,
                     max_words=koc.max_words, model=model, fallback_model=fallback,
-                    extra_instruction=extra, koc=koc if use_koc else None, stop_flag=stop,
+                    extra_instruction=extra, koc=koc if use_koc else None,
+                    custom_prompt=custom["text"] if custom["enabled"] else "", stop_flag=stop,
                     progress_cb=lambda m: self.task_queue.put((job, "status", m)),
                 )
                 self.task_queue.put((job, "script", (res, seconds)))

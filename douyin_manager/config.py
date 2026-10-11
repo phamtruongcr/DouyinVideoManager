@@ -389,6 +389,21 @@ def read_koc_brief(cfg: dict) -> dict:
     }
 
 
+# --- Prompt tùy chỉnh (system prompt do người dùng tự soạn, thay cho prompt dựng sẵn) ---
+# Khóa trong cfg: review_use_custom_prompt (bật/tắt), review_custom_prompt (nội dung),
+# review_saved_prompts (danh sách prompt đã đặt tên — xem prompt_library.py).
+CUSTOM_PROMPT_MAX_LEN = 8000
+
+
+def read_custom_prompt(cfg: dict) -> dict:
+    """Đọc prompt tùy chỉnh. `enabled` chỉ True khi đã bật VÀ có nội dung (bật mà trống -> dùng prompt mặc định)."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    use = cfg.get("review_use_custom_prompt", False)
+    use = use if isinstance(use, bool) else False
+    text = str(cfg.get("review_custom_prompt") or "").strip()[:CUSTOM_PROMPT_MAX_LEN]
+    return {"use": use, "text": text, "enabled": use and bool(text)}
+
+
 def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
