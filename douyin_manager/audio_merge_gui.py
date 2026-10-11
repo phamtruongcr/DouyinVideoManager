@@ -2,7 +2,8 @@
 audio_merge_gui.py
 ====================
 TAB "Ghép Audio vào Video" (nằm cạnh tab tải video trong cửa sổ chính):
-chọn thư mục, chế độ ghép cặp (khớp tên / trộn ngẫu nhiên), tùy chọn kích
+chọn thư mục, chế độ ghép cặp (khớp tên / trộn ngẫu nhiên) hoặc tự chọn thủ công
+1 video + 1 audio bất kỳ (nút "Thêm cặp thủ công"), tùy chọn kích
 thước/tỉ lệ khung hình/chất lượng/hiệu ứng âm thanh/chèn chữ & blur, xem thử
 TỪNG dòng (file xem thử chỉ nằm trong thư mục tạm, tự xóa), xóa dòng không
 ưng ý, tick chọn dòng cần ghép, chạy ffmpeg (song song, dừng được giữa
@@ -38,6 +39,7 @@ from .audio_merger import (
     build_random_mix_pairs,
     cleanup_stale_preview_dirs,
     create_preview_dir,
+    describe_duration_mismatch,
     ffmpeg_filter_has_option,
     ffmpeg_filter_option_type,
     ffmpeg_has_filter,
@@ -51,6 +53,7 @@ from .audio_merger import (
     run_ffmpeg_merge,
     save_pair_history,
     assign_unique_output_paths,
+    validate_manual_pair,
     write_merge_log_csv,
 )
 from .config import (
@@ -128,6 +131,114 @@ class OverlayConfigError(ValueError):
     cho người dùng)."""
 
 
+class ManualPairDialog(tk.Toplevel):
+    """Hộp thoại chọn thủ công 1 video + 1 audio có sẵn (không cần cùng tên,
+    không cần nằm trong thư mục đã quét). Kết quả ở `self.result` =
+    (đường dẫn video, đường dẫn audio), hoặc None nếu người dùng hủy."""
+
+    def __init__(self, master, video_dir: Path | None, audio_dir: Path | None):
+        super().__init__(master)
+        self.title("Thêm cặp thủ công")
+        self.resizable(True, False)
+        self.transient(master.winfo_toplevel())
+        self.result: tuple[Path, Path] | None = None
+        self._video_dir = video_dir
+        self._audio_dir = audio_dir
+        self.video_var = tk.StringVar()
+        self.audio_var = tk.StringVar()
+
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        ttk.Label(
+            body, text="Chọn 1 video và 1 audio có sẵn (không cần cùng tên file).",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+        ttk.Label(body, text="Video").grid(row=1, column=0, sticky="w")
+        ttk.Entry(body, textvariable=self.video_var, width=64).grid(
+            row=1, column=1, sticky="ew", padx=8, pady=3)
+        ttk.Button(body, text="Chọn...", command=self._pick_video).grid(row=1, column=2)
+
+        ttk.Label(body, text="Audio").grid(row=2, column=0, sticky="w")
+        ttk.Entry(body, textvariable=self.audio_var, width=64).grid(
+            row=2, column=1, sticky="ew", padx=8, pady=3)
+        ttk.Button(body, text="Chọn...", command=self._pick_audio).grid(row=2, column=2)
+
+        btns = ttk.Frame(body)
+        btns.grid(row=3, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        ttk.Button(btns, text="Hủy", command=self.destroy).pack(side="left")
+        ttk.Button(btns, text="Thêm vào danh sách", command=self._on_ok).pack(
+            side="left", padx=(8, 0))
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<Return>", lambda e: self._on_ok())
+
+        self.update_idletasks()
+        try:  # canh giữa cửa sổ cha
+            top = master.winfo_toplevel()
+            x = top.winfo_rootx() + max(0, (top.winfo_width() - self.winfo_reqwidth()) // 2)
+            y = top.winfo_rooty() + max(0, (top.winfo_height() - self.winfo_reqheight()) // 3)
+            self.geometry(f"+{x}+{y}")
+        except tk.TclError:
+            pass
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _clean_path(raw: str) -> str:
+        # Đường dẫn dán/kéo thả từ Finder/Explorer hay có dấu nháy bao quanh
+        return raw.strip().strip('"').strip("'").strip()
+
+    def _initial_dir(self, current: str, fallback: Path | None) -> str:
+        cur = self._clean_path(current)
+        if cur:
+            parent = Path(cur).expanduser().parent
+            if parent.is_dir():
+                return str(parent)
+        if fallback and fallback.is_dir():
+            return str(fallback)
+        return str(Path.home())
+
+    def _pick_video(self):
+        exts = " ".join(f"*{e}" for e in sorted(VIDEO_EXTENSIONS))
+        chosen = filedialog.askopenfilename(
+            parent=self, title="Chọn video",
+            initialdir=self._initial_dir(self.video_var.get(), self._video_dir),
+            filetypes=[("Video", exts), ("Tất cả", "*.*")],
+        )
+        if chosen:
+            self.video_var.set(chosen)
+
+    def _pick_audio(self):
+        exts = " ".join(f"*{e}" for e in sorted(AUDIO_EXTENSIONS))
+        chosen = filedialog.askopenfilename(
+            parent=self, title="Chọn audio",
+            initialdir=self._initial_dir(self.audio_var.get(), self._audio_dir),
+            filetypes=[("Audio", exts), ("Tất cả", "*.*")],
+        )
+        if chosen:
+            self.audio_var.set(chosen)
+
+    def _on_ok(self):
+        video_raw = self._clean_path(self.video_var.get())
+        audio_raw = self._clean_path(self.audio_var.get())
+        if not video_raw or not audio_raw:
+            messagebox.showwarning(APP_TITLE, "Hãy chọn đủ cả video và audio.", parent=self)
+            return
+        video = Path(video_raw).expanduser()
+        audio = Path(audio_raw).expanduser()
+        for label, path in (("video", video), ("audio", audio)):
+            if not path.is_file():
+                messagebox.showwarning(
+                    APP_TITLE, f"Không tìm thấy file {label}:\n{path}", parent=self)
+                return
+        self.result = (video, audio)
+        self.destroy()
+
+
 CHECK_ON = "\u2611"   # ☑
 CHECK_OFF = "\u2610"  # ☐
 
@@ -164,6 +275,9 @@ class AudioMergeTab(ttk.Frame):
         )
 
         self.pairs: list[MediaPair] = []
+        self.manual_pairs: list[MediaPair] = []   # cặp tự chọn (giữ lại khi quét lại, không lưu khi tắt app)
+        self._manual_counter = 0                  # đánh số key duy nhất cho cặp thủ công
+        self.is_adding = False                    # đang kiểm tra (ffprobe) 1 cặp thủ công
         self.row_by_stem: dict[str, str] = {}      # key nội bộ của cặp -> iid trong Treeview
         self.pair_by_iid: dict[str, MediaPair] = {}  # iid -> cặp
         self.checked: dict[str, bool] = {}         # key nội bộ -> có tick ghép không
@@ -220,6 +334,10 @@ class AudioMergeTab(ttk.Frame):
         self.actions_bar = bar
         bar.add(ttk.Button(bar, text="☑  Chọn tất cả", command=lambda: self._set_all_checked(True)))
         bar.add(ttk.Button(bar, text="☐  Bỏ chọn tất cả", command=lambda: self._set_all_checked(False)))
+        self.add_manual_btn = ttk.Button(
+            bar, text="＋  Thêm cặp thủ công...", command=self.on_add_manual_pair
+        )
+        bar.add(self.add_manual_btn)
         self.delete_btn = ttk.Button(bar, text="🗑  Xóa các dòng đã chọn", command=self.on_delete_rows)
         bar.add(self.delete_btn)
         self.preview_btn = ttk.Button(
@@ -924,6 +1042,8 @@ class AudioMergeTab(ttk.Frame):
             save_config(self.cfg)
         else:
             self.pairs = match_video_audio_pairs(videos, audios)
+        # Cặp thủ công do người dùng tự thêm luôn được giữ lại khi quét lại
+        self.pairs = self.pairs + self.manual_pairs
 
         self.tree.delete(*self.tree.get_children())
         self.row_by_stem.clear()
@@ -932,32 +1052,7 @@ class AudioMergeTab(ttk.Frame):
         self.text_checked.clear()
         self.bg_checked.clear()
         for i, pair in enumerate(self.pairs):
-            # Random Mix có thể có nhiều dòng trùng stem (cùng video ghép
-            # nhiều audio khác nhau qua nhiều vòng) -> dùng key riêng theo
-            # thứ tự để cập nhật status không bị đè nhau.
-            key = f"{pair.stem}#{i}"
-            pair.stem = key  # dùng key duy nhất làm định danh nội bộ từ đây
-            # Mặc định TICK sẵn mọi dòng đã đủ video + audio — cả ghép lẫn
-            # chèn chữ lẫn nhạc nền (chèn chữ/nhạc nền chỉ thực sự áp dụng
-            # khi bật ở tab tương ứng).
-            self.checked[key] = pair.is_ready
-            self.text_checked[key] = True
-            self.bg_checked[key] = True
-            item_id = self.tree.insert(
-                "", "end",
-                values=(
-                    CHECK_ON if pair.is_ready else "",
-                    CHECK_ON if pair.is_ready else "",
-                    pair.video.name if pair.video else "—",
-                    pair.audio.name if pair.audio else "—",
-                    pair.status,
-                    i + 1,  # STT
-                    CHECK_ON if pair.is_ready else "",  # bg_chk
-                    "…" if pair.video else "—",  # duration (điền sau bằng ffprobe)
-                ),
-            )
-            self.row_by_stem[key] = item_id
-            self.pair_by_iid[item_id] = pair
+            self._insert_pair_row(pair, i)
 
         self._refresh_all_check_heading()
         self._refresh_all_text_check_heading()
@@ -967,7 +1062,131 @@ class AudioMergeTab(ttk.Frame):
         if not self.pairs:
             self.status_var.set("Không tìm thấy video/audio nào trong 2 thư mục đã chọn.")
         else:
-            self._update_list_summary(prefix="Đã quét xong. ")
+            kept = f" (giữ lại {len(self.manual_pairs)} cặp thủ công)" if self.manual_pairs else ""
+            self._update_list_summary(prefix=f"Đã quét xong{kept}. ")
+
+    def _insert_pair_row(self, pair: MediaPair, index: int) -> str:
+        """Thêm 1 cặp vào bảng + các dict trạng thái; trả về iid của dòng.
+        Dùng chung cho quét thư mục và thêm cặp thủ công."""
+        if pair.manual:
+            # Cặp thủ công đã có key duy nhất (đuôi "#m<số>") từ lúc tạo, giữ nguyên
+            # qua các lần quét lại.
+            key = pair.stem
+        else:
+            # Random Mix có thể có nhiều dòng trùng stem (cùng video ghép
+            # nhiều audio khác nhau qua nhiều vòng) -> dùng key riêng theo
+            # thứ tự để cập nhật status không bị đè nhau.
+            key = f"{pair.stem}#{index}"
+            pair.stem = key  # dùng key duy nhất làm định danh nội bộ từ đây
+        # Mặc định TICK sẵn mọi dòng đã đủ video + audio — cả ghép lẫn
+        # chèn chữ lẫn nhạc nền (chèn chữ/nhạc nền chỉ thực sự áp dụng
+        # khi bật ở tab tương ứng).
+        self.checked[key] = pair.is_ready
+        self.text_checked[key] = True
+        self.bg_checked[key] = True
+        item_id = self.tree.insert(
+            "", "end",
+            values=(
+                CHECK_ON if pair.is_ready else "",
+                CHECK_ON if pair.is_ready else "",
+                pair.video.name if pair.video else "—",
+                pair.audio.name if pair.audio else "—",
+                pair.status,
+                index + 1,  # STT
+                CHECK_ON if pair.is_ready else "",  # bg_chk
+                "…" if pair.video else "—",  # duration (điền sau bằng ffprobe)
+            ),
+        )
+        self.row_by_stem[key] = item_id
+        self.pair_by_iid[item_id] = pair
+        return item_id
+
+    # ------------------------------------------------ Cặp thủ công (1 video + 1 audio) --
+    @staticmethod
+    def _same_file(a: Path | None, b: Path | None) -> bool:
+        if a is None or b is None:
+            return False
+        try:
+            return os.path.samefile(a, b)
+        except OSError:
+            return a == b
+
+    def on_add_manual_pair(self):
+        """Chọn 1 video + 1 audio bất kỳ rồi thêm thành 1 dòng trong danh sách."""
+        if self.is_running:
+            messagebox.showinfo(APP_TITLE, "Đang ghép — hãy đợi xong hoặc bấm Dừng rồi mới thêm cặp.")
+            return
+        if self.is_adding:
+            self.status_var.set("Đang kiểm tra cặp trước đó, vui lòng đợi một chút...")
+            return
+        self._detect_ffmpeg()
+        if not self.ffprobe_path:
+            messagebox.showerror(
+                APP_TITLE,
+                "Chưa tìm thấy ffprobe nên chưa kiểm tra được file. Hãy bấm \"Tải ffmpeg\" để cài "
+                "đặt (chọn bản \"full\"), hoặc \"Chọn ffmpeg thủ công\".",
+            )
+            return
+
+        dlg = ManualPairDialog(self, self.video_dir, self.audio_dir)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        video, audio = dlg.result
+
+        for iid, p in self.pair_by_iid.items():
+            if self._same_file(p.video, video) and self._same_file(p.audio, audio):
+                self.tree.selection_set(iid)
+                self.tree.see(iid)
+                self.status_var.set("Cặp video + audio này đã có trong danh sách.")
+                return
+
+        self.is_adding = True
+        self.add_manual_btn.state(["disabled"])
+        self.status_var.set(f"Đang kiểm tra {video.name} + {audio.name}...")
+        ffprobe = self.ffprobe_path
+        loop_audio = bool(self.loop_audio_var.get())   # đọc widget trên luồng chính
+
+        def worker():
+            try:
+                video_info, audio_info = validate_manual_pair(ffprobe, video, audio)
+            except MergeError as exc:
+                self.task_queue.put(("manual_pair_error", str(exc)))
+                return
+            except Exception as exc:  # noqa: BLE001 - luôn nhả nút ra khi có lỗi bất ngờ
+                self.task_queue.put(("manual_pair_error", f"Lỗi không mong đợi: {exc}"))
+                return
+            self.task_queue.put((
+                "manual_pair_ready",
+                (video, audio, video_info.duration, audio_info.duration, loop_audio),
+            ))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _add_manual_pair_row(
+        self, video: Path, audio: Path, video_seconds: float, audio_seconds: float, loop_audio: bool
+    ):
+        self._manual_counter += 1
+        pair = MediaPair(f"{video.stem}#m{self._manual_counter}", video, audio, manual=True)
+        self.manual_pairs.append(pair)
+        self.pairs.append(pair)
+        iid = self._insert_pair_row(pair, len(self.pairs) - 1)
+        self._set_row_duration(iid, self._format_duration(video_seconds))
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        self.tree.see(iid)
+        self._refresh_all_check_heading()
+        self._refresh_all_text_check_heading()
+        self._refresh_all_bg_check_heading()
+
+        msg = (
+            f"Đã thêm cặp thủ công: video {self._format_duration(video_seconds)}, "
+            f"audio {self._format_duration(audio_seconds)}. "
+        )
+        warning = describe_duration_mismatch(video_seconds, audio_seconds, loop_audio)
+        if warning:
+            msg += warning + " "
+        self._update_list_summary(prefix=msg)
 
     def _renumber_rows(self):
         """Đánh lại STT (1, 2, 3...) theo thứ tự dòng hiện tại sau khi xóa."""
@@ -1228,6 +1447,7 @@ class AudioMergeTab(ttk.Frame):
                 self.tree.delete(iid)
         removed_ids = {id(p) for p in removed_pairs}
         self.pairs = [p for p in self.pairs if id(p) not in removed_ids]
+        self.manual_pairs = [p for p in self.manual_pairs if id(p) not in removed_ids]
 
         self._renumber_rows()
 
@@ -1544,6 +1764,9 @@ class AudioMergeTab(ttk.Frame):
         if self.is_previewing:
             messagebox.showinfo(APP_TITLE, "Đang tạo bản xem thử — hãy đợi vài giây rồi bấm ghép.")
             return
+        if self.is_adding:
+            messagebox.showinfo(APP_TITLE, "Đang kiểm tra cặp thủ công vừa thêm — hãy đợi vài giây rồi bấm ghép.")
+            return
 
         try:
             # Đọc mọi tùy chọn trên LUỒNG CHÍNH (widget Tk không an toàn khi
@@ -1569,6 +1792,7 @@ class AudioMergeTab(ttk.Frame):
         self.start_btn.state(["disabled"])
         self.preview_btn.state(["disabled"])
         self.delete_btn.state(["disabled"])
+        self.add_manual_btn.state(["disabled"])
         self.stop_btn.state(["!disabled"])
         self.status_var.set(f"Đang ghép {len(ready_pairs)} cặp video/audio...")
 
@@ -1653,7 +1877,8 @@ class AudioMergeTab(ttk.Frame):
             with lock:
                 counters["done"] += 1
                 done_count = sum(counters.values())
-                used_pairs_this_run.add((pair.video.name, pair.audio.name))
+                if not pair.manual:   # cặp thủ công không tính vào lịch sử tránh lặp của Random Mix
+                    used_pairs_this_run.add((pair.video.name, pair.audio.name))
             log_rows.append({"video": pair.video.name, "audio": pair.audio.name,
                               "output_file": output_path.name, "status": "Đã xong", "message": "", "time": now})
             self.task_queue.put(
@@ -1712,6 +1937,7 @@ class AudioMergeTab(ttk.Frame):
                     self.is_running = False
                     self.start_btn.state(["!disabled"])
                     self.delete_btn.state(["!disabled"])
+                    self.add_manual_btn.state(["!disabled"])
                     if not self.is_previewing:
                         self.preview_btn.state(["!disabled"])
                     self.stop_btn.state(["disabled"])
@@ -1725,6 +1951,15 @@ class AudioMergeTab(ttk.Frame):
                         iid = self.row_by_stem.get(key)
                         if iid:
                             self._set_row_duration(iid, text)
+                elif kind == "manual_pair_ready":
+                    self.is_adding = False
+                    self.add_manual_btn.state(["!disabled"])
+                    self._add_manual_pair_row(*payload)
+                elif kind == "manual_pair_error":
+                    self.is_adding = False
+                    self.add_manual_btn.state(["!disabled"])
+                    self.status_var.set("Không thêm được cặp thủ công.")
+                    messagebox.showerror(APP_TITLE, f"Không thêm được cặp thủ công:\n{payload}")
                 elif kind == "preview_ready":
                     self.is_previewing = False
                     self.preview_btn.state(["!disabled"])

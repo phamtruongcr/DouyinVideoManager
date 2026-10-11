@@ -117,19 +117,25 @@ def list_media_files(folder: Optional[Path], extensions: set[str]) -> list[Path]
 
 
 class MediaPair:
-    """1 dòng trong danh sách ghép."""
+    """1 dòng trong danh sách ghép.
 
-    __slots__ = ("stem", "video", "audio")
+    `manual=True`: cặp do người dùng tự chọn 1 video + 1 audio bất kỳ (nút
+    "Thêm cặp thủ công"), không đến từ việc quét thư mục."""
 
-    def __init__(self, stem: str, video: Optional[Path], audio: Optional[Path]):
+    __slots__ = ("stem", "video", "audio", "manual")
+
+    def __init__(
+        self, stem: str, video: Optional[Path], audio: Optional[Path], manual: bool = False
+    ):
         self.stem = stem
         self.video = video
         self.audio = audio
+        self.manual = manual
 
     @property
     def status(self) -> str:
         if self.video and self.audio:
-            return "Sẵn sàng"
+            return "Sẵn sàng (thủ công)" if self.manual else "Sẵn sàng"
         if self.video and not self.audio:
             return "Thiếu audio khớp tên"
         return "Thiếu video khớp tên"
@@ -319,6 +325,66 @@ def probe_media_info(ffprobe_path: str, path: Path) -> MediaInfo:
         raise MergeError(
             f"Không đọc được thông tin file '{path.name}' (file có thể bị hỏng): {exc}"
         ) from exc
+
+
+# ============================================================================
+# Cặp video + audio do người dùng tự chọn (thủ công)
+# ============================================================================
+
+# Chênh lệch độ dài video/audio nhỏ hơn mức này coi như bằng nhau (không cảnh báo).
+DURATION_TOLERANCE_SECONDS = 0.5
+
+
+def validate_manual_pair(
+    ffprobe_path: str, video: Path, audio: Path
+) -> tuple[MediaInfo, MediaInfo]:
+    """Kiểm tra 1 cặp video + audio người dùng tự chọn trước khi đưa vào danh
+    sách ghép. Trả về (thông tin video, thông tin audio).
+
+    Raise `MergeError` (thông báo hiển thị thẳng cho người dùng) nếu file
+    không tồn tại, không đọc được, "video" không có luồng hình (VD: lỡ chọn
+    file mp3 vào ô video) hoặc "audio" không có luồng tiếng."""
+    for label, path in (("video", video), ("audio", audio)):
+        if not path.is_file():
+            raise MergeError(f"Không tìm thấy file {label}:\n{path}")
+
+    video_info = probe_media_info(ffprobe_path, video)
+    if video_info.width <= 0 or video_info.height <= 0:
+        raise MergeError(
+            f"File '{video.name}' không có hình ảnh nên không dùng làm video được. "
+            "Hãy kiểm tra lại có chọn nhầm file audio vào ô video không."
+        )
+    audio_info = probe_media_info(ffprobe_path, audio)
+    if not audio_info.has_audio:
+        raise MergeError(
+            f"File '{audio.name}' không có luồng âm thanh nên không dùng làm audio được."
+        )
+    return video_info, audio_info
+
+
+def describe_duration_mismatch(
+    video_seconds: float, audio_seconds: float, loop_audio: bool = False
+) -> str:
+    """Câu cảnh báo khi audio và video lệch độ dài đáng kể, theo đúng cách
+    `build_ffmpeg_command` xử lý (video là gốc quyết định độ dài file xuất).
+    Trả về chuỗi rỗng nếu độ dài gần bằng nhau (lệch ≤ DURATION_TOLERANCE_SECONDS)."""
+    diff = audio_seconds - video_seconds
+    if abs(diff) <= DURATION_TOLERANCE_SECONDS:
+        return ""
+    if diff > 0:
+        return (
+            f"Audio dài hơn video {diff:.1f} giây — phần audio thừa ở cuối sẽ bị cắt "
+            "cho khớp độ dài video."
+        )
+    if loop_audio:
+        return (
+            f"Audio ngắn hơn video {-diff:.1f} giây — audio sẽ được lặp lại cho đủ "
+            "độ dài video."
+        )
+    return (
+        f"Audio ngắn hơn video {-diff:.1f} giây — phần cuối video sẽ im lặng "
+        "(bật \"Lặp lại audio\" ở tab Audio nếu muốn lặp)."
+    )
 
 
 # ============================================================================

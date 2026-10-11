@@ -277,6 +277,10 @@ class DouyinApp(tk.Tk):
     def _build_ui(self):
         self.notebook = SegmentedTabs(self, variant="main")
         self.notebook.pack(fill="both", expand=True)
+        # Nút "Cài đặt chung" nằm ở GÓC PHẢI TRÊN, cùng hàng với các tab
+        ttk.Button(
+            self.notebook.corner, text="⚙  Cài đặt chung", command=self.open_settings
+        ).pack()
 
         self.tab_download = ttk.Frame(self.notebook)
         self.merge_tab = AudioMergeTab(self.notebook, self.cfg)
@@ -444,9 +448,6 @@ class DouyinApp(tk.Tk):
             bg="#1a73e8", hover_bg="#1557b0", padx=18, pady=6,
         )
         self.load_btn.pack(side="left")
-        ttk.Button(
-            source_btns, text="⚙ Cài đặt (Cookie)", command=self.open_settings
-        ).pack(side="left", padx=(8, 0))
         if self.cfg.get("fetch_cond_collapsed", False):
             self._toggle_conditions(save=False)
 
@@ -1783,7 +1784,7 @@ class DouyinApp(tk.Tk):
         if not items:
             self.status_var.set(
                 "Không lấy được video nào. Kiểm tra lại link hoặc cập nhật Cookie ở "
-                "mục Cài đặt (Douyin cần Cookie Douyin; TikTok/Facebook có thể cần Cookie "
+                "mục Cài đặt chung (Douyin cần Cookie Douyin; TikTok/Facebook có thể cần Cookie "
                 "của trang đó, hoặc mở lại app để tự cập nhật yt-dlp; với Facebook hãy thử dán từng link video)."
             )
             return
@@ -2112,13 +2113,13 @@ class DouyinApp(tk.Tk):
         if not self.gemini_api_key and auto:
             self.status_var.set(
                 "Chưa có Gemini API Key nên bỏ qua dịch tự động — nhập key ở "
-                "\"Cài đặt (Cookie)\"."
+                "\"Cài đặt chung\" (góc phải trên)."
             )
             return
         if not self.gemini_api_key:
             messagebox.showwarning(
                 APP_TITLE,
-                "Chưa có Gemini API Key. Hãy vào mục \"Cài đặt (Cookie)\" để nhập "
+                "Chưa có Gemini API Key. Hãy vào mục \"Cài đặt chung\" (góc phải trên) để nhập "
                 "API Key (lấy miễn phí tại https://aistudio.google.com/apikey).",
             )
             self.open_settings()

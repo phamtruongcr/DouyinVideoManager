@@ -406,7 +406,10 @@ class SegmentedTabs(tk.Frame):
     `select(index)`. Các frame con phải được tạo với master là chính widget này.
 
     variant="main": thanh tab chính trên cùng cửa sổ (tab chọn viền xanh dương).
-    variant="sub" : nhóm tab con trong thẻ (tab chọn nền xám sáng)."""
+    variant="sub" : nhóm tab con trong thẻ (tab chọn nền xám sáng).
+
+    `corner`: khung nằm ở GÓC PHẢI cùng hàng với thanh tab (không làm lệch
+    thanh tab khỏi vị trí giữa)."""
 
     def __init__(self, master, variant: str = "sub", outer_bg: str | None = None, **kwargs):
         self.variant = variant
@@ -415,17 +418,37 @@ class SegmentedTabs(tk.Frame):
 
         holder = tk.Frame(self, bg=self._outer_bg)
         holder.pack(side="top", fill="x", pady=(6, 4) if variant == "main" else (0, 6))
+        # 3 cột: [trống | thanh tab | góc phải]. Đủ chỗ thì cột 0 và 2 rộng bằng nhau
+        # -> thanh tab nằm đúng GIỮA; cửa sổ quá hẹp thì thanh tab lệch trái một
+        # chút để nút ở góc phải luôn hiện đủ (xem `_balance_sides`).
+        self._holder = holder
+        holder.columnconfigure(0, weight=1)
+        holder.columnconfigure(2, weight=1)
+        holder.bind("<Configure>", lambda e: self._balance_sides(e.width))
         self._bar = tk.Frame(
             holder, bg=theme.SEG_BG, bd=0, highlightthickness=1,
             highlightbackground=theme.SEG_BORDER, highlightcolor=theme.SEG_BORDER,
         )
-        self._bar.pack(anchor="center")   # luôn nằm giữa
+        self._bar.grid(row=0, column=1)
+        # Khung góc phải: đặt nút/widget bất kỳ lên đây (VD nút "Cài đặt chung"),
+        # master của widget là `self.corner`. Để trống thì không chiếm chỗ.
+        self.corner = tk.Frame(holder, bg=self._outer_bg)
+        self.corner.grid(row=0, column=2, sticky="e", padx=(8, 12))
 
         self.body = tk.Frame(self, bg=self._outer_bg)
         self.body.pack(side="top", fill="both", expand=True)
 
         self._tabs: list[tuple[tk.Widget, tk.Label]] = []
         self._current: int | None = None
+
+    def _balance_sides(self, width: int):
+        """Chỉnh bề rộng tối thiểu cột trái/phải của hàng tab để thanh tab ở giữa
+        nhưng không bao giờ làm khung góc phải bị cắt khi cửa sổ hẹp."""
+        side = self.corner.winfo_reqwidth() + 20          # + padx (8, 12) của khung góc
+        spare = width - self._bar.winfo_reqwidth()
+        left = max(0, min(side, spare - side))
+        self._holder.columnconfigure(0, minsize=left)
+        self._holder.columnconfigure(2, minsize=side)
 
     def add(self, frame: tk.Widget, text: str = ""):
         idx = len(self._tabs)

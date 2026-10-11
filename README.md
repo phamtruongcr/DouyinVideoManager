@@ -36,6 +36,7 @@ Luồng một video: **chọn video** (từ *Lịch sử tải* hoặc một th�
 
 ### Tab "Ghép Audio vào Video" (cần ffmpeg)
 - Ghép audio vào hàng loạt video: khớp theo tên file hoặc trộn ngẫu nhiên.
+- **Thêm cặp thủ công**: bấm **＋ Thêm cặp thủ công...** để chọn 1 video + 1 audio có sẵn bất kỳ (không cần cùng tên, không cần nằm trong thư mục đã quét) và thêm thành 1 dòng trong danh sách. App kiểm tra file (video phải có hình, audio phải có tiếng) và cảnh báo nếu audio dài/ngắn hơn video. Dòng thủ công dùng chung mọi tùy chọn, xem thử, tick chữ/nhạc nền như các dòng khác; được **giữ lại khi quét lại** thư mục và **không lưu** sau khi tắt app. Xóa bằng nút "Xóa các dòng đã chọn".
 - Chọn độ phân giải, chất lượng (CRF), tỉ lệ khung hình (16:9, 9:16, 1:1, 4:5, tùy chỉnh) và cách xử lý phần dư (crop / nền mờ / viền đen).
 - Chuẩn hóa âm lượng, fade, trộn thêm nhạc nền, giữ một phần audio gốc.
 - **Trình chỉnh sửa chữ kiểu CapCut**: nhiều lớp chữ, kéo thả trên khung xem trước, timeline thời gian hiện từng lớp, mẫu kiểu chữ dựng sẵn, và lớp **blur** để che phụ đề/logo cũ.
@@ -83,7 +84,7 @@ Lần đầu mở app trên macOS: chuột phải → *Open*, hoặc chạy `xat
 
 ## Hướng dẫn sử dụng nhanh
 
-1. **Cài đặt → Quản lý Cookie**: với Douyin, cần Cookie của một phiên trình duyệt đã vào douyin.com (không cần đăng nhập tài khoản). Cách dễ nhất: chọn trình duyệt/profile rồi bấm **Lấy Cookie ngay**, hoặc bật **Tự lấy lại mỗi lần Lấy danh sách**. Firefox đọc ổn định nhất; Chrome/Edge bản mới trên Windows có thể không đọc được — khi đó hãy dán Cookie thủ công. TikTok và Facebook thường không bắt buộc Cookie, trừ kênh bị chặn hoặc video riêng tư.
+1. Bấm nút **⚙ Cài đặt chung** (góc phải trên, cùng hàng với các tab) → **Quản lý Cookie**: với Douyin, cần Cookie của một phiên trình duyệt đã vào douyin.com (không cần đăng nhập tài khoản). Cách dễ nhất: chọn trình duyệt/profile rồi bấm **Lấy Cookie ngay**, hoặc bật **Tự lấy lại mỗi lần Lấy danh sách**. Firefox đọc ổn định nhất; Chrome/Edge bản mới trên Windows có thể không đọc được — khi đó hãy dán Cookie thủ công. TikTok và Facebook thường không bắt buộc Cookie, trừ kênh bị chặn hoặc video riêng tư.
 2. (Tùy chọn) **Cài đặt → Cấu hình Gemini API**: dán API key, bấm tải danh sách model và chọn model chính + dự phòng.
 3. Chọn **thư mục lưu** trên thanh công cụ chính.
 4. Dán link kênh hoặc link video → **Lấy danh sách video** (đặt điều kiện lọc nếu cần).
